@@ -1,0 +1,1148 @@
+//! Pure Rust API fuzzer — no Python dependency
+//!
+//! Parses OpenAPI spec with serde_json, generates requests with datagen,
+//! sends with reqwest, checks responses.
+
+mod checks;
+mod phases;
+mod spec;
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::time::Instant;
+
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
+
+use apifuzz_core::schema::{RawCase, RawFailure, RawInteraction, RawResponse, SchemathesisOutput};
+use apifuzz_core::{Config, Probe};
+
+use crate::datagen;
+
+use checks::CheckInput;
+use checks::run_checks;
+use phases::{
+    FuzzPhase, Overrides, collect_boundary_cases, collect_probe_cases,
+    collect_type_confusion_cases, generate_neighborhood_override,
+};
+use spec::{Operation, ParamLocation, extract_operations};
+
+/// Fuzz intensity level
+#[derive(Debug, Clone, Copy, Default)]
+pub enum FuzzLevel {
+    /// 100 examples
+    Quick,
+    /// 1000 examples
+    #[default]
+    Normal,
+    /// 5000 examples
+    Heavy,
+}
+
+impl FuzzLevel {
+    #[must_use]
+    pub const fn max_examples(self) -> u32 {
+        match self {
+            Self::Quick => 100,
+            Self::Normal => 1000,
+            Self::Heavy => 5000,
+        }
+    }
+}
+
+/// Accumulates fuzz results across all operations and phases.
+struct FuzzAccumulator {
+    total: u64,
+    success: u64,
+    failures: Vec<RawFailure>,
+    interactions: Vec<RawInteraction>,
+    errors: Vec<String>,
+    seen_spec_gaps: HashSet<String>,
+}
+
+impl FuzzAccumulator {
+    fn new() -> Self {
+        Self {
+            total: 0,
+            success: 0,
+            failures: Vec::new(),
+            interactions: Vec::new(),
+            errors: Vec::new(),
+            seen_spec_gaps: HashSet::new(),
+        }
+    }
+
+    /// Record one execution result. Returns `true` if the request had failures.
+    fn record(
+        &mut self,
+        result: Result<(RawInteraction, Vec<RawFailure>), String>,
+        op_label: &str,
+        phase_label: &str,
+    ) -> bool {
+        self.total += 1;
+        match result {
+            Ok((interaction, failures)) => {
+                let failed = !failures.is_empty();
+                if !failed {
+                    self.success += 1;
+                }
+                self.failures.extend(failures);
+                self.interactions.push(interaction);
+                failed
+            }
+            Err(e) => {
+                self.errors.push(format!("{op_label}: {phase_label}: {e}"));
+                false
+            }
+        }
+    }
+
+    fn into_output(self) -> SchemathesisOutput {
+        SchemathesisOutput {
+            total: self.total,
+            success: self.success,
+            failure_count: u64::try_from(self.failures.len()).unwrap_or(u64::MAX),
+            failures: self.failures,
+            interactions: self.interactions,
+            errors: self.errors,
+        }
+    }
+}
+
+/// Per-phase statistics for progress reporting.
+#[derive(Default)]
+struct PhaseStats {
+    total: u32,
+    fail: u32,
+}
+
+impl PhaseStats {
+    fn record(&mut self, failed: bool) {
+        self.total += 1;
+        if failed {
+            self.fail += 1;
+        }
+    }
+}
+
+/// Pure Rust API fuzzer
+pub struct NativeRunner {
+    spec_path: PathBuf,
+    base_url: String,
+    headers: HashMap<String, String>,
+    path_params: HashMap<String, String>,
+    probes: Vec<Probe>,
+    response_time_limit: Option<f64>,
+    level: FuzzLevel,
+}
+
+impl NativeRunner {
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            spec_path: config.spec.clone(),
+            base_url: config.base_url.clone(),
+            headers: config.headers.clone(),
+            path_params: config.path_params.clone(),
+            probes: config.probes.clone(),
+            response_time_limit: config.response_time_limit,
+            level: FuzzLevel::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_level(mut self, level: FuzzLevel) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// Run the fuzzer. Returns output compatible with existing verdict pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if spec cannot be read/parsed or HTTP client fails to build.
+    pub fn run(&self) -> Result<SchemathesisOutput, NativeError> {
+        let spec_content = std::fs::read_to_string(&self.spec_path)
+            .map_err(|e| NativeError::Io(format!("{}: {e}", self.spec_path.display())))?;
+        let spec: serde_json::Value = serde_json::from_str(&spec_content)
+            .map_err(|e| NativeError::Parse(format!("Invalid JSON: {e}")))?;
+
+        let components = spec
+            .get("components")
+            .and_then(|c| c.get("schemas"))
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+
+        let operations = extract_operations(&spec);
+
+        if operations.is_empty() {
+            return Err(NativeError::Parse(
+                "No operations found in OpenAPI spec".into(),
+            ));
+        }
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| NativeError::Http(e.to_string()))?;
+
+        let mut rng = SmallRng::from_entropy();
+        let max_examples = self.level.max_examples();
+        let mut acc = FuzzAccumulator::new();
+
+        let neighborhood_count = max_examples / 3;
+        let random_count = max_examples - neighborhood_count;
+
+        let probe_count: usize = self.probes.len();
+        eprintln!(
+            "Fuzzing {} operations ({} probes + boundary + type-confusion + {} near + {} rand)...",
+            operations.len(),
+            probe_count,
+            neighborhood_count,
+            random_count
+        );
+
+        for op in &operations {
+            let op_label = format!("{} {}", op.method, op.path);
+
+            // Phase 0: Custom probes (user-defined known-bug patterns)
+            let probe_cases = collect_probe_cases(op, &self.probes);
+            let mut pr = PhaseStats::default();
+            for ov in &probe_cases {
+                let r = self.execute_one(
+                    &client,
+                    op,
+                    &components,
+                    &mut rng,
+                    Some(ov),
+                    FuzzPhase::Probe,
+                    &mut acc.seen_spec_gaps,
+                );
+                pr.record(acc.record(r, &op_label, "probe"));
+            }
+
+            // Phase 1: Fixed boundary (deterministic)
+            let boundary_cases = collect_boundary_cases(op, &components);
+            let mut p1 = PhaseStats::default();
+            for ov in &boundary_cases {
+                let r = self.execute_one(
+                    &client,
+                    op,
+                    &components,
+                    &mut rng,
+                    Some(ov),
+                    FuzzPhase::Boundary,
+                    &mut acc.seen_spec_gaps,
+                );
+                p1.record(acc.record(r, &op_label, "boundary"));
+            }
+
+            // Phase 1b: Type confusion (deterministic)
+            let tc_cases = collect_type_confusion_cases(op, &components);
+            let mut tc = PhaseStats::default();
+            for ov in &tc_cases {
+                let r = self.execute_one(
+                    &client,
+                    op,
+                    &components,
+                    &mut rng,
+                    Some(ov),
+                    FuzzPhase::TypeConfusion,
+                    &mut acc.seen_spec_gaps,
+                );
+                tc.record(acc.record(r, &op_label, "type-confusion"));
+            }
+
+            // Phase 2: Boundary neighborhood random
+            let mut p2 = PhaseStats::default();
+            for _ in 0..neighborhood_count {
+                let overrides = generate_neighborhood_override(op, &components, &mut rng);
+                let ov = if overrides.params.is_empty() && overrides.body_props.is_empty() {
+                    None
+                } else {
+                    Some(&overrides)
+                };
+                let r = self.execute_one(
+                    &client,
+                    op,
+                    &components,
+                    &mut rng,
+                    ov,
+                    FuzzPhase::Neighborhood,
+                    &mut acc.seen_spec_gaps,
+                );
+                p2.record(acc.record(r, &op_label, "neighborhood"));
+            }
+
+            // Phase 3: Full random
+            let mut p3 = PhaseStats::default();
+            for _ in 0..random_count {
+                let r = self.execute_one(
+                    &client,
+                    op,
+                    &components,
+                    &mut rng,
+                    None,
+                    FuzzPhase::Random,
+                    &mut acc.seen_spec_gaps,
+                );
+                p3.record(acc.record(r, &op_label, "random"));
+            }
+
+            let total_fail = pr.fail + p1.fail + tc.fail + p2.fail + p3.fail;
+            if total_fail > 0 {
+                let probe_str = if pr.total > 0 {
+                    format!("probe {}/{}, ", pr.fail, pr.total)
+                } else {
+                    String::new()
+                };
+                eprintln!(
+                    "  {op_label}: {total_fail} failures ({probe_str}fixed {}/{}, type {}/{}, near {}/{neighborhood_count}, rand {}/{random_count})",
+                    p1.fail, p1.total, tc.fail, tc.total, p2.fail, p3.fail
+                );
+            } else {
+                let probe_str = if pr.total > 0 {
+                    format!("{} probe + ", pr.total)
+                } else {
+                    String::new()
+                };
+                eprintln!(
+                    "  {op_label}: OK ({probe_str}{} fixed + {} type + {neighborhood_count} near + {random_count} rand)",
+                    p1.total, tc.total
+                );
+            }
+        }
+
+        Ok(acc.into_output())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_one(
+        &self,
+        client: &reqwest::blocking::Client,
+        op: &Operation,
+        components: &serde_json::Value,
+        rng: &mut impl Rng,
+        overrides: Option<&Overrides>,
+        phase: FuzzPhase,
+        seen_spec_gaps: &mut HashSet<String>,
+    ) -> Result<(RawInteraction, Vec<RawFailure>), String> {
+        // Build URL with path parameters
+        let mut url_path = op.path.clone();
+        let mut path_params_resolved: HashMap<String, serde_json::Value> = HashMap::new();
+        for param in &op.parameters {
+            if param.location == ParamLocation::Path {
+                let value = if let Some(ov) = overrides.and_then(|o| o.params.get(&param.name)) {
+                    value_to_param_string(ov)
+                } else {
+                    self.path_params
+                        .get(&param.name)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            datagen::generate(&param.schema, components, rng)
+                                .to_string()
+                                .trim_matches('"')
+                                .to_string()
+                        })
+                };
+                url_path = url_path.replace(&format!("{{{}}}", param.name), &value);
+                path_params_resolved.insert(param.name.clone(), serde_json::Value::String(value));
+            }
+        }
+        let url = format!("{}{url_path}", self.base_url);
+
+        // Query parameters
+        let mut query_params: Vec<(String, String)> = Vec::new();
+        for p in &op.parameters {
+            if p.location == ParamLocation::Query {
+                if let Some(ov) = overrides.and_then(|o| o.params.get(&p.name)) {
+                    // Boundary: always include overridden params
+                    query_params.push((p.name.clone(), value_to_param_string(ov)));
+                } else if p.required || rng.gen_bool(0.3) {
+                    let v = datagen::generate(&p.schema, components, rng);
+                    query_params.push((p.name.clone(), value_to_param_string(&v)));
+                }
+            }
+        }
+
+        // Headers (configured + spec-defined)
+        let mut req_headers = self.headers.clone();
+        for param in &op.parameters {
+            if param.location == ParamLocation::Header {
+                if let Some(ov) = overrides.and_then(|o| o.params.get(&param.name)) {
+                    req_headers.insert(param.name.clone(), value_to_param_string(ov));
+                } else {
+                    let v = datagen::generate(&param.schema, components, rng);
+                    req_headers.insert(param.name.clone(), value_to_param_string(&v));
+                }
+            }
+        }
+
+        // Request body
+        let body = op.request_body_schema.as_ref().map(|schema| {
+            let mut generated = datagen::generate(schema, components, rng);
+            // Apply body property overrides
+            if let Some(ov) = overrides {
+                if let serde_json::Value::Object(ref mut obj) = generated {
+                    for (k, v) in &ov.body_props {
+                        obj.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            generated
+        });
+
+        // Build request
+        let method = reqwest::Method::from_bytes(op.method.as_bytes())
+            .map_err(|_| format!("invalid HTTP method '{}' for {}", op.method, op.path))?;
+
+        let mut req = client.request(method, &url);
+        for (k, v) in &req_headers {
+            // Skip header values that are invalid in HTTP (e.g. \0, \r\n from
+            // boundary testing).  These never reach the server so testing them
+            // via headers has no value.
+            if reqwest::header::HeaderValue::from_str(v).is_ok() {
+                req = req.header(k, v);
+            }
+        }
+        for (k, v) in &query_params {
+            req = req.query(&[(k, v)]);
+        }
+        if let Some(ref body_value) = body {
+            req = req.header("Content-Type", "application/json");
+            req = req.json(body_value);
+        }
+
+        // Send
+        let start = Instant::now();
+        let resp = req.send().map_err(|e| e.to_string())?;
+        let elapsed = start.elapsed().as_secs_f64();
+
+        let status_code = resp.status().as_u16();
+        let status_text = resp.status().canonical_reason().unwrap_or("").to_string();
+
+        // Read Content-Type before consuming response body
+        let resp_content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        // Capture response body (truncated for memory safety)
+        let body_text = resp.text().unwrap_or_default();
+        let content_length = body_text.len() as u64;
+        const MAX_BODY_BYTES: usize = 4096;
+        let body_stored = if body_text.is_empty() {
+            None
+        } else if body_text.len() <= MAX_BODY_BYTES {
+            Some(body_text.clone())
+        } else {
+            // Safe UTF-8 truncation: walk back to char boundary
+            let mut end = MAX_BODY_BYTES;
+            while end > 0 && !body_text.is_char_boundary(end) {
+                end -= 1;
+            }
+            Some(format!(
+                "{}…({} bytes total)",
+                &body_text[..end],
+                body_text.len()
+            ))
+        };
+
+        let case_id = format!("{:016x}", rng.r#gen::<u64>());
+        let operation_label = format!("{} {}", op.method, op.path);
+
+        let raw_case = RawCase {
+            method: op.method.clone(),
+            path: op.path.clone(),
+            id: Some(case_id.clone()),
+            path_parameters: if path_params_resolved.is_empty() {
+                None
+            } else {
+                Some(path_params_resolved)
+            },
+            headers: if req_headers.is_empty() {
+                None
+            } else {
+                Some(req_headers.clone())
+            },
+            query: if query_params.is_empty() {
+                None
+            } else {
+                Some(
+                    query_params
+                        .iter()
+                        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                        .collect(),
+                )
+            },
+            body: body.clone(),
+            media_type: body.as_ref().map(|_| "application/json".to_string()),
+        };
+
+        let raw_response = RawResponse {
+            status_code,
+            elapsed,
+            message: status_text,
+            content_length,
+            body: body_stored,
+        };
+
+        // Run all 6 response checks (pure logic, no I/O)
+        let mut check_input = CheckInput {
+            status_code,
+            body_text: &body_text,
+            content_type: resp_content_type.as_deref(),
+            elapsed,
+            url: &url,
+            operation_label: &operation_label,
+            case_id: &case_id,
+            phase,
+            op,
+            response_time_limit: self.response_time_limit,
+            seen_spec_gaps,
+        };
+        let failures = run_checks(&mut check_input);
+
+        let interaction = RawInteraction {
+            case: raw_case,
+            response: raw_response,
+            operation: operation_label,
+            failures: failures.clone(),
+        };
+
+        Ok((interaction, failures))
+    }
+}
+
+fn value_to_param_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NativeError {
+    #[error("IO error: {0}")]
+    Io(String),
+    #[error("Parse error: {0}")]
+    Parse(String),
+    #[error("HTTP error: {0}")]
+    Http(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use checks::CheckInput;
+    use checks::run_checks;
+    use phases::FuzzPhase;
+    use spec::Operation;
+
+    // ── Test helpers ──
+
+    fn base_op() -> Operation {
+        Operation {
+            method: "GET".to_string(),
+            path: "/test".to_string(),
+            parameters: vec![],
+            request_body_schema: None,
+            expected_statuses: vec![200, 422],
+            response_schemas: HashMap::new(),
+            response_content_types: HashMap::new(),
+        }
+    }
+
+    fn check(input: &mut CheckInput) -> Vec<RawFailure> {
+        run_checks(input)
+    }
+
+    fn input_with<'a>(
+        op: &'a Operation,
+        status: u16,
+        body: &'a str,
+        seen: &'a mut HashSet<String>,
+    ) -> CheckInput<'a> {
+        CheckInput {
+            status_code: status,
+            body_text: body,
+            content_type: Some("application/json"),
+            elapsed: 0.05,
+            url: "http://localhost:8080/test",
+            operation_label: "GET /test",
+            case_id: "test-001",
+            phase: FuzzPhase::Random,
+            op,
+            response_time_limit: None,
+            seen_spec_gaps: seen,
+        }
+    }
+
+    fn has_type(failures: &[RawFailure], ft: &str) -> bool {
+        failures.iter().any(|f| f.failure_type == ft)
+    }
+
+    fn find_type<'a>(failures: &'a [RawFailure], ft: &str) -> Option<&'a RawFailure> {
+        failures.iter().find(|f| f.failure_type == ft)
+    }
+
+    // ── extract_operations ──
+
+    #[test]
+    fn extract_operations_from_spec() {
+        let spec = serde_json::json!({
+            "openapi": "3.1.0",
+            "info": {"title": "Test", "version": "1.0"},
+            "paths": {
+                "/health": {
+                    "get": {
+                        "responses": {"200": {"description": "OK"}}
+                    }
+                },
+                "/users": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {"name": {"type": "string"}},
+                                        "required": ["name"]
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {"200": {}, "400": {}}
+                    }
+                },
+                "/users/{user_id}": {
+                    "get": {
+                        "parameters": [
+                            {"name": "user_id", "in": "path", "required": true, "schema": {"type": "integer"}}
+                        ],
+                        "responses": {"200": {}, "404": {}}
+                    }
+                }
+            }
+        });
+
+        let ops = extract_operations(&spec);
+        assert_eq!(ops.len(), 3);
+
+        let health = ops.iter().find(|o| o.path == "/health").unwrap();
+        assert_eq!(health.method, "GET");
+        assert!(health.parameters.is_empty());
+
+        let create = ops.iter().find(|o| o.path == "/users").unwrap();
+        assert_eq!(create.method, "POST");
+        assert!(create.request_body_schema.is_some());
+        assert!(create.expected_statuses.contains(&200));
+        assert!(create.expected_statuses.contains(&400));
+
+        let get_user = ops
+            .iter()
+            .find(|o| o.path == "/users/{user_id}" && o.method == "GET")
+            .unwrap();
+        assert_eq!(get_user.parameters.len(), 1);
+        assert_eq!(get_user.parameters[0].name, "user_id");
+    }
+
+    // ═══════════════════════════════════════════
+    // Check 1: ServerError (5xx)
+    // ═══════════════════════════════════════════
+
+    #[test]
+    fn check1_500_detected() {
+        let op = base_op();
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 500, "Internal Server Error", &mut seen);
+        let f = check(&mut input);
+        assert!(has_type(&f, "ServerError"), "500 must be detected");
+    }
+
+    #[test]
+    fn check1_502_detected() {
+        let op = base_op();
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 502, "Bad Gateway", &mut seen);
+        let f = check(&mut input);
+        assert!(has_type(&f, "ServerError"), "502 must be detected");
+    }
+
+    #[test]
+    fn check1_200_not_flagged() {
+        let op = base_op();
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &mut seen);
+        // Give it a schema so check5 doesn't fire spec-gap warning
+        let mut op2 = base_op();
+        op2.response_schemas
+            .insert(200, serde_json::json!({"type": "object"}));
+        op2.response_content_types
+            .insert(200, vec!["application/json".to_string()]);
+        input.op = &op2;
+        let f = check(&mut input);
+        assert!(!has_type(&f, "ServerError"), "200 must not be ServerError");
+    }
+
+    #[test]
+    fn check1_400_not_flagged() {
+        let op = base_op();
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 400, "Bad Request", &mut seen);
+        let f = check(&mut input);
+        assert!(!has_type(&f, "ServerError"), "400 must not be ServerError");
+    }
+
+    // ═══════════════════════════════════════════
+    // Check 2: StatusCodeConformance
+    // ═══════════════════════════════════════════
+
+    #[test]
+    fn check2_undeclared_status_detected() {
+        let op = base_op(); // expected: [200, 422]
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 404, "Not Found", &mut seen);
+        let f = check(&mut input);
+        assert!(
+            has_type(&f, "StatusCodeConformance"),
+            "404 not in [200, 422] must be detected"
+        );
+        let fail = find_type(&f, "StatusCodeConformance").unwrap();
+        assert!(fail.message.contains("404 not in spec"));
+    }
+
+    #[test]
+    fn check2_declared_status_ok() {
+        let mut op = base_op();
+        op.response_schemas
+            .insert(200, serde_json::json!({"type": "object"}));
+        op.response_content_types
+            .insert(200, vec!["application/json".to_string()]);
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &mut seen);
+        let f = check(&mut input);
+        assert!(
+            !has_type(&f, "StatusCodeConformance"),
+            "200 is declared, should not fire"
+        );
+    }
+
+    #[test]
+    fn check2_5xx_excluded() {
+        let op = base_op();
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 500, "error", &mut seen);
+        let f = check(&mut input);
+        assert!(
+            !has_type(&f, "StatusCodeConformance"),
+            "5xx excluded from conformance check"
+        );
+        assert!(has_type(&f, "ServerError"));
+    }
+
+    #[test]
+    fn check2_empty_expected_skips() {
+        let mut op = base_op();
+        op.expected_statuses = vec![];
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 404, "Not Found", &mut seen);
+        let f = check(&mut input);
+        assert!(
+            !has_type(&f, "StatusCodeConformance"),
+            "No expected statuses → skip (no basis for comparison)"
+        );
+    }
+
+    // ═══════════════════════════════════════════
+    // Check 3: NegativeTestAccepted
+    // ═══════════════════════════════════════════
+
+    #[test]
+    fn check3_type_confusion_2xx_detected() {
+        let mut op = base_op();
+        op.response_schemas
+            .insert(200, serde_json::json!({"type": "object"}));
+        op.response_content_types
+            .insert(200, vec!["application/json".to_string()]);
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &mut seen);
+        input.phase = FuzzPhase::TypeConfusion;
+        let f = check(&mut input);
+        assert!(
+            has_type(&f, "NegativeTestAccepted"),
+            "TypeConfusion + 2xx must be detected"
+        );
+    }
+
+    #[test]
+    fn check3_type_confusion_422_not_flagged() {
+        let op = base_op();
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 422, r#"{"detail":"err"}"#, &mut seen);
+        input.phase = FuzzPhase::TypeConfusion;
+        let f = check(&mut input);
+        assert!(
+            !has_type(&f, "NegativeTestAccepted"),
+            "TypeConfusion + 422 = server rejected, correct behavior"
+        );
+    }
+
+    #[test]
+    fn check3_random_phase_2xx_not_flagged() {
+        let mut op = base_op();
+        op.response_schemas
+            .insert(200, serde_json::json!({"type": "object"}));
+        op.response_content_types
+            .insert(200, vec!["application/json".to_string()]);
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &mut seen);
+        input.phase = FuzzPhase::Random;
+        let f = check(&mut input);
+        assert!(
+            !has_type(&f, "NegativeTestAccepted"),
+            "Random phase must not trigger negative test check"
+        );
+    }
+
+    #[test]
+    fn check3_boundary_phase_2xx_not_flagged() {
+        let mut op = base_op();
+        op.response_schemas
+            .insert(200, serde_json::json!({"type": "object"}));
+        op.response_content_types
+            .insert(200, vec!["application/json".to_string()]);
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &mut seen);
+        input.phase = FuzzPhase::Boundary;
+        let f = check(&mut input);
+        assert!(!has_type(&f, "NegativeTestAccepted"));
+    }
+
+    // ═══════════════════════════════════════════
+    // Check 4: ResponseTimeExceeded
+    // ═══════════════════════════════════════════
+
+    #[test]
+    fn check4_exceeded_detected() {
+        let op = base_op();
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, "{}", &mut seen);
+        input.response_time_limit = Some(1.0);
+        input.elapsed = 2.5;
+        let f = check(&mut input);
+        assert!(has_type(&f, "ResponseTimeExceeded"));
+        let fail = find_type(&f, "ResponseTimeExceeded").unwrap();
+        assert!(fail.elapsed == Some(2.5));
+        assert!(fail.deadline == Some(1.0));
+    }
+
+    #[test]
+    fn check4_under_limit_ok() {
+        let op = base_op();
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, "{}", &mut seen);
+        input.response_time_limit = Some(5.0);
+        input.elapsed = 0.05;
+        let f = check(&mut input);
+        assert!(
+            !has_type(&f, "ResponseTimeExceeded"),
+            "Under limit must not fire"
+        );
+    }
+
+    #[test]
+    fn check4_no_limit_configured() {
+        let op = base_op();
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, "{}", &mut seen);
+        input.response_time_limit = None;
+        input.elapsed = 999.0;
+        let f = check(&mut input);
+        assert!(
+            !has_type(&f, "ResponseTimeExceeded"),
+            "No limit configured → skip"
+        );
+    }
+
+    // ═══════════════════════════════════════════
+    // Check 5: SchemaViolation
+    // ═══════════════════════════════════════════
+
+    #[test]
+    fn check5_body_violates_schema() {
+        let mut op = base_op();
+        op.response_schemas.insert(
+            200,
+            serde_json::json!({
+                "type": "object",
+                "properties": {"id": {"type": "integer"}},
+                "required": ["id"]
+            }),
+        );
+        op.response_content_types
+            .insert(200, vec!["application/json".to_string()]);
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"id": "not-a-number"}"#, &mut seen);
+        let f = check(&mut input);
+        assert!(
+            has_type(&f, "SchemaViolation"),
+            "Body violating schema must be detected"
+        );
+        let fail = find_type(&f, "SchemaViolation").unwrap();
+        assert_eq!(fail.title, "Response body does not match schema");
+    }
+
+    #[test]
+    fn check5_body_matches_schema() {
+        let mut op = base_op();
+        op.response_schemas.insert(
+            200,
+            serde_json::json!({
+                "type": "object",
+                "properties": {"id": {"type": "integer"}},
+                "required": ["id"]
+            }),
+        );
+        op.response_content_types
+            .insert(200, vec!["application/json".to_string()]);
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"id": 42}"#, &mut seen);
+        let f = check(&mut input);
+        assert!(
+            !has_type(&f, "SchemaViolation"),
+            "Valid body must not fire SchemaViolation"
+        );
+    }
+
+    #[test]
+    fn check5_non_json_body_with_schema() {
+        let mut op = base_op();
+        op.response_schemas
+            .insert(200, serde_json::json!({"type": "object"}));
+        op.response_content_types
+            .insert(200, vec!["application/json".to_string()]);
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, "this is not json", &mut seen);
+        let f = check(&mut input);
+        assert!(has_type(&f, "SchemaViolation"));
+        let fail = find_type(&f, "SchemaViolation").unwrap();
+        assert_eq!(fail.title, "Response body is not valid JSON");
+    }
+
+    #[test]
+    fn check5_empty_schema_warns_on_2xx() {
+        let mut op = base_op();
+        op.response_schemas.insert(200, serde_json::json!({}));
+        op.response_content_types
+            .insert(200, vec!["application/json".to_string()]);
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"anything": "goes"}"#, &mut seen);
+        let f = check(&mut input);
+        assert!(
+            has_type(&f, "SchemaViolation"),
+            "Empty schema on 2xx must warn (spec gap)"
+        );
+        let fail = find_type(&f, "SchemaViolation").unwrap();
+        assert_eq!(fail.title, "Response schema is empty");
+        assert_eq!(fail.severity, "medium");
+    }
+
+    #[test]
+    fn check5_no_schema_defined_warns_on_2xx() {
+        let mut op = base_op();
+        op.response_content_types
+            .insert(200, vec!["application/json".to_string()]);
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"data": 1}"#, &mut seen);
+        let f = check(&mut input);
+        assert!(
+            has_type(&f, "SchemaViolation"),
+            "No schema for 2xx with body must warn (spec gap)"
+        );
+        let fail = find_type(&f, "SchemaViolation").unwrap();
+        assert_eq!(fail.title, "No response schema defined");
+    }
+
+    #[test]
+    fn check5_no_schema_on_4xx_silent() {
+        let op = base_op();
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 422, r#"{"detail":"err"}"#, &mut seen);
+        let f = check(&mut input);
+        assert!(
+            !f.iter().any(|ff| ff.failure_type == "SchemaViolation"),
+            "Non-2xx missing schema should not warn"
+        );
+    }
+
+    #[test]
+    fn check5_no_schema_on_2xx_empty_body_silent() {
+        let op = base_op();
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, "", &mut seen);
+        let f = check(&mut input);
+        assert!(
+            !f.iter().any(|ff| ff.failure_type == "SchemaViolation"
+                && ff.title == "No response schema defined"),
+            "No schema + empty body → no warning needed"
+        );
+    }
+
+    // ═══════════════════════════════════════════
+    // Check 6: ContentTypeMismatch
+    // ═══════════════════════════════════════════
+
+    #[test]
+    fn check6_mismatch_detected() {
+        let mut op = base_op();
+        op.response_content_types
+            .insert(200, vec!["application/json".to_string()]);
+        op.response_schemas
+            .insert(200, serde_json::json!({"type": "object"}));
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"<html>oops</html>"#, &mut seen);
+        input.content_type = Some("text/html");
+        let f = check(&mut input);
+        assert!(
+            has_type(&f, "ContentTypeMismatch"),
+            "text/html when spec says application/json must be detected"
+        );
+        let fail = find_type(&f, "ContentTypeMismatch").unwrap();
+        assert_eq!(fail.title, "Unexpected Content-Type");
+    }
+
+    #[test]
+    fn check6_match_ok() {
+        let mut op = base_op();
+        op.response_content_types
+            .insert(200, vec!["application/json".to_string()]);
+        op.response_schemas
+            .insert(200, serde_json::json!({"type": "object"}));
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &mut seen);
+        let f = check(&mut input);
+        assert!(
+            !has_type(&f, "ContentTypeMismatch"),
+            "Matching Content-Type must not fire"
+        );
+    }
+
+    #[test]
+    fn check6_charset_ignored() {
+        let mut op = base_op();
+        op.response_content_types
+            .insert(200, vec!["application/json".to_string()]);
+        op.response_schemas
+            .insert(200, serde_json::json!({"type": "object"}));
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &mut seen);
+        input.content_type = Some("application/json; charset=utf-8");
+        let f = check(&mut input);
+        assert!(
+            !has_type(&f, "ContentTypeMismatch"),
+            "charset param must be ignored in comparison"
+        );
+    }
+
+    #[test]
+    fn check6_missing_header_detected() {
+        let mut op = base_op();
+        op.response_content_types
+            .insert(200, vec!["application/json".to_string()]);
+        op.response_schemas
+            .insert(200, serde_json::json!({"type": "object"}));
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &mut seen);
+        input.content_type = None;
+        let f = check(&mut input);
+        assert!(
+            has_type(&f, "ContentTypeMismatch"),
+            "Missing Content-Type header when spec declares types must be detected"
+        );
+        let fail = find_type(&f, "ContentTypeMismatch").unwrap();
+        assert_eq!(fail.title, "Missing Content-Type header");
+    }
+
+    #[test]
+    fn check6_no_types_declared_warns_on_2xx() {
+        let mut op = base_op();
+        op.response_schemas
+            .insert(200, serde_json::json!({"type": "object"}));
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &mut seen);
+        let f = check(&mut input);
+        assert!(
+            has_type(&f, "ContentTypeMismatch"),
+            "No content types declared for 2xx must warn (spec gap)"
+        );
+        let fail = find_type(&f, "ContentTypeMismatch").unwrap();
+        assert_eq!(fail.title, "No content types declared in spec");
+    }
+
+    #[test]
+    fn check6_no_types_on_4xx_silent() {
+        let op = base_op();
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 422, r#"{"detail":"err"}"#, &mut seen);
+        let f = check(&mut input);
+        assert!(
+            !f.iter().any(|ff| ff.failure_type == "ContentTypeMismatch"
+                && ff.title == "No content types declared in spec"),
+            "Non-2xx missing content types should not warn"
+        );
+    }
+
+    // ═══════════════════════════════════════════
+    // Cross-check: multiple checks fire together
+    // ═══════════════════════════════════════════
+
+    #[test]
+    fn multiple_checks_fire_simultaneously() {
+        let mut op = base_op();
+        op.response_schemas.insert(
+            200,
+            serde_json::json!({
+                "type": "object",
+                "properties": {"id": {"type": "integer"}},
+                "required": ["id"]
+            }),
+        );
+        op.response_content_types
+            .insert(200, vec!["application/xml".to_string()]);
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"id": "wrong"}"#, &mut seen);
+        input.phase = FuzzPhase::TypeConfusion;
+        input.response_time_limit = Some(0.01);
+        input.elapsed = 1.0;
+        let f = check(&mut input);
+        assert!(has_type(&f, "NegativeTestAccepted"), "Check 3");
+        assert!(has_type(&f, "ResponseTimeExceeded"), "Check 4");
+        assert!(has_type(&f, "SchemaViolation"), "Check 5");
+        assert!(has_type(&f, "ContentTypeMismatch"), "Check 6");
+    }
+
+    #[test]
+    fn clean_200_with_full_spec_no_failures() {
+        let mut op = base_op();
+        op.response_schemas.insert(
+            200,
+            serde_json::json!({
+                "type": "object",
+                "properties": {"status": {"type": "string"}},
+                "required": ["status"]
+            }),
+        );
+        op.response_content_types
+            .insert(200, vec!["application/json".to_string()]);
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"status": "ok"}"#, &mut seen);
+        let f = check(&mut input);
+        assert!(
+            f.is_empty(),
+            "Clean response with full spec → zero failures, got: {f:?}"
+        );
+    }
+}

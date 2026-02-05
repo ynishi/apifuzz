@@ -1,0 +1,18 @@
+[package]
+name = "apifuzz"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Robust API fuzzing CLI with strict failure detection"
+
+[[bin]]
+name = "apifuzz"
+path = "src/main.rs"
+
+[dependencies]
+apifuzz-core.workspace = true
+apifuzz-runner.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+toml.workspace = true

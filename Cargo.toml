@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/apifuzz-core",
+    "crates/apifuzz-cli",
+    "crates/apifuzz-runner",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["apifuzz contributors"]
+
+[workspace.dependencies]
+# Core
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+
+# HTTP/Random
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+rand = { version = "0.8", features = ["small_rng"] }
+
+# Validation
+jsonschema = "0.41"
+
+# Testing
+insta = { version = "1", features = ["yaml"] }
+proptest = "1"
+
+# Internal
+apifuzz-core = { path = "crates/apifuzz-core" }
+apifuzz-runner = { path = "crates/apifuzz-runner" }

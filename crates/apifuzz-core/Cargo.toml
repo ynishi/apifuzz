@@ -1,0 +1,17 @@
+[package]
+name = "apifuzz-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Core types and verdict logic for API fuzzing"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+proptest.workspace = true
