@@ -321,7 +321,7 @@ fn run(cli: Cli) -> Result<i32> {
         }
 
         Commands::Guide => {
-            print!("{}", include_str!("../../../docs/GUIDE.md"));
+            print!("{}", include_str!("../docs/GUIDE.md"));
             Ok(0)
         }
     }

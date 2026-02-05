@@ -57,7 +57,7 @@ fuzzing scenarios.
 
 ## Documentation
 
-- **[Usage Guide](docs/GUIDE.md)** - Config, phases, probes, CI, exit codes
+- **[Usage Guide](crates/apifuzz-cli/docs/GUIDE.md)** - Config, phases, probes, CI, exit codes
 - `apifuzz guide` - Same content from CLI (works offline)
 
 ## Project Structure
@@ -67,7 +67,7 @@ crates/
   apifuzz-core/     # Types, verdict logic, config
   apifuzz-runner/   # Fuzzing engine (datagen, HTTP, phases)
   apifuzz-cli/      # CLI (clap)
-docs/
+crates/apifuzz-cli/docs/
   GUIDE.md          # Canonical usage guide (embedded in binary)
 examples/
   python-server/    # FastAPI buggy API (port 8080)
