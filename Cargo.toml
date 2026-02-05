@@ -12,6 +12,11 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 authors = ["apifuzz contributors"]
+readme = "README.md"
+repository = "https://github.com/ynishi/apifuzz"
+homepage = "https://github.com/ynishi/apifuzz"
+keywords = ["api", "fuzzing", "openapi", "testing", "security"]
+categories = ["development-tools::testing", "web-programming"]
 
 [workspace.dependencies]
 # Core
@@ -37,5 +42,5 @@ insta = { version = "1", features = ["yaml"] }
 proptest = "1"
 
 # Internal
-apifuzz-core = { path = "crates/apifuzz-core" }
-apifuzz-runner = { path = "crates/apifuzz-runner" }
+apifuzz-core = { path = "crates/apifuzz-core", version = "0.1.0" }
+apifuzz-runner = { path = "crates/apifuzz-runner", version = "0.1.0" }
