@@ -1,0 +1,8 @@
+spec = "openapi.json"
+base_url = "http://localhost:3000"
+response_time_limit = 0.001
+
+[headers]
+
+[path_params]
+id = "1"

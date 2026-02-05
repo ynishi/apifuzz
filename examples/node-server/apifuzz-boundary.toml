@@ -1,0 +1,37 @@
+spec = "openapi.json"
+base_url = "http://localhost:3000"
+
+[headers]
+
+[path_params]
+id = "999"
+
+# Non-existent ID to trigger 404 (undeclared for most endpoints)
+[[probes]]
+operation = "GET /items/{id}"
+target = "id"
+string = ["0", "-1", "999", "abc"]
+
+# Extreme discount values
+[[probes]]
+operation = "POST /orders"
+target = "discount"
+string = ["-1", "2", "100", "NaN"]
+
+# Prototype pollution attempt
+[[probes]]
+operation = "POST /merge"
+target = "__proto__"
+string = ["{\"admin\":true}"]
+
+# Empty array for process
+[[probes]]
+operation = "POST /process"
+target = "items"
+string = ["[]"]
+
+# Unknown operation for process
+[[probes]]
+operation = "POST /process"
+target = "operation"
+string = ["unknown", "delete", ""]

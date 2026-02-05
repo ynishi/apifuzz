@@ -19,6 +19,32 @@ apifuzz fuzz --level quick      # run (quick/normal/heavy)
 apifuzz guide                   # full usage reference
 ```
 
+## Try with Examples
+
+Example target servers with intentional bugs are included for testing.
+
+### Python (FastAPI)
+
+```bash
+cd examples/python-server
+pip install fastapi uvicorn pydantic[email]
+python main.py &                # starts on :8080
+apifuzz fuzz -c apifuzz.toml --level quick
+```
+
+### Node.js (Express)
+
+```bash
+cd examples/node-server
+npm install
+node server.js &                # starts on :3000
+apifuzz fuzz -c apifuzz.toml --level quick
+```
+
+Each example directory contains multiple config variants
+(`apifuzz-probes.toml`, `apifuzz-boundary.toml`, etc.) for different
+fuzzing scenarios.
+
 ## Fuzzing Phases
 
 | Phase | Strategy | Source |
@@ -43,4 +69,7 @@ crates/
   apifuzz-cli/      # CLI (clap)
 docs/
   GUIDE.md          # Canonical usage guide (embedded in binary)
+examples/
+  python-server/    # FastAPI buggy API (port 8080)
+  node-server/      # Express buggy API (port 3000)
 ```

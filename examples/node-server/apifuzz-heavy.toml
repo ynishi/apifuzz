@@ -1,0 +1,14 @@
+spec = "openapi.json"
+base_url = "http://localhost:3000"
+response_time_limit = 0.5
+
+[headers]
+
+[path_params]
+id = "1"
+
+# Probe: force format=csv/xml to trigger Content-Type mismatch
+[[probes]]
+operation = "GET /report"
+target = "format"
+string = ["csv", "xml"]

@@ -1,0 +1,9 @@
+spec = "openapi.json"
+base_url = "http://localhost:8080"
+response_time_limit = 0.001
+
+[headers]
+
+[path_params]
+user_id = "1"
+product_id = "1"

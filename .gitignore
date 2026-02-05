@@ -8,6 +8,7 @@ Cargo.lock
 .apifuzz*.toml
 .apifuzz*.json
 apifuzz.toml
+!examples/**/apifuzz*.toml
 
 # Python
 __pycache__/

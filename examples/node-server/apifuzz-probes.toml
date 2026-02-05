@@ -1,0 +1,43 @@
+spec = "openapi.json"
+base_url = "http://localhost:3000"
+response_time_limit = 0.005
+
+[headers]
+
+[path_params]
+id = "1"
+
+# Content-Type mismatch probes
+[[probes]]
+operation = "GET /report"
+target = "format"
+string = ["csv", "xml", "html", "yaml"]
+
+# Boundary probes for compute (NaN, Infinity, zero)
+[[probes]]
+operation = "GET /compute/{value}"
+target = "value"
+string = ["0", "-1", "999999999999999999", "NaN", "abc"]
+
+# Boundary for orders (type confusion)
+[[probes]]
+operation = "POST /orders"
+target = "quantity"
+string = ["abc", "0", "-1", "99999999"]
+
+# Boundary for user posts (negative page, huge limit)
+[[probes]]
+operation = "GET /users/{id}/posts"
+target = "page"
+string = ["-1", "0", "999999"]
+
+[[probes]]
+operation = "GET /users/{id}/posts"
+target = "limit"
+string = ["-1", "0", "999999"]
+
+# Year boundary for report
+[[probes]]
+operation = "GET /report"
+target = "year"
+string = ["1999", "0", "-1", "99999"]
