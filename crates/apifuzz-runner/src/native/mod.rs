@@ -19,13 +19,13 @@ use apifuzz_core::{Config, Probe};
 
 use crate::datagen;
 
-use checks::run_checks;
 use checks::CheckInput;
+use checks::run_checks;
 use phases::{
-    collect_boundary_cases, collect_probe_cases, collect_type_confusion_cases,
-    generate_neighborhood_override, FuzzPhase, Overrides,
+    FuzzPhase, Overrides, collect_boundary_cases, collect_probe_cases,
+    collect_type_confusion_cases, generate_neighborhood_override,
 };
-use spec::{extract_operations, Operation, ParamLocation};
+use spec::{Operation, ParamLocation, extract_operations};
 
 /// Fuzz intensity level
 #[derive(Debug, Clone, Copy, Default)]
@@ -810,8 +810,8 @@ pub enum NativeError {
 mod tests {
     use super::*;
 
-    use checks::run_checks;
     use checks::CheckInput;
+    use checks::run_checks;
     use phases::FuzzPhase;
     use spec::Operation;
 

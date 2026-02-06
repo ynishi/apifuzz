@@ -9,7 +9,7 @@ use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 use apifuzz_core::status;
-use apifuzz_core::{classify_failures, to_http_file, Config, VerdictPolicy, VerdictStatus};
+use apifuzz_core::{Config, VerdictPolicy, VerdictStatus, classify_failures, to_http_file};
 use apifuzz_runner::{FuzzLevel, NativeRunner};
 
 #[derive(Parser)]
