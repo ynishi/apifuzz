@@ -302,6 +302,8 @@ mod tests {
             response_time_limit: None,
             success_criteria: SuccessCriteria::Default,
             min_success_rate: None,
+            dump: false,
+            dump_dir: None,
         }
     }
 

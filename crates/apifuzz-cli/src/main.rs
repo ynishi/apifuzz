@@ -52,6 +52,14 @@ enum Commands {
         /// Show execution plan without sending requests
         #[arg(long)]
         dry_run: bool,
+
+        /// Dump all request/response pairs to JSONL files
+        #[arg(long)]
+        dump: bool,
+
+        /// Directory for dump files (default: .apifuzz/dumps)
+        #[arg(long)]
+        dump_dir: Option<String>,
     },
 
     /// Initialize config file
@@ -119,6 +127,8 @@ fn run(cli: Cli) -> Result<i32> {
             output_dir,
             config,
             dry_run,
+            dump,
+            dump_dir,
         } => {
             // Load config
             let cfg = if let Some(path) = config {
@@ -338,6 +348,41 @@ fn run(cli: Cli) -> Result<i32> {
                     println!("{}", serde_json::to_string_pretty(&json_output)?);
                 }
                 OutputFormat::Silent => {}
+            }
+
+            // Dump all interactions if requested (CLI flag or config)
+            let should_dump = dump || cfg.dump;
+            if should_dump {
+                let dump_path = dump_dir
+                    .as_deref()
+                    .map(std::path::PathBuf::from)
+                    .or(cfg.dump_dir.clone())
+                    .unwrap_or_else(|| std::path::PathBuf::from(".apifuzz/dumps"));
+
+                match apifuzz_core::dump::write_dump(
+                    &output.interactions,
+                    &dump_path,
+                    true, // mask sensitive headers
+                ) {
+                    Ok(index) => {
+                        if cli.output != OutputFormat::Silent {
+                            eprintln!(
+                                "Dump: {} interactions → {} ({})",
+                                index.total,
+                                dump_path.display(),
+                                index
+                                    .operations
+                                    .iter()
+                                    .map(|e| e.file.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: failed to write dump: {e}");
+                    }
+                }
             }
 
             // Persist report to ~/.apifuzz/reports/

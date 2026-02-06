@@ -41,6 +41,7 @@ serde_yml = "0.0.12"
 # Testing
 insta = { version = "1", features = ["yaml"] }
 proptest = "1"
+tempfile = "3"
 
 # Internal
 apifuzz-core = { path = "crates/apifuzz-core", version = "0.1.0" }

@@ -60,6 +60,14 @@ pub struct Config {
     /// Default: 0.1 (10%)
     #[serde(default)]
     pub min_success_rate: Option<f64>,
+
+    /// Dump all request/response pairs to JSONL files
+    #[serde(default)]
+    pub dump: bool,
+
+    /// Directory for dump files (default: ".apifuzz/dumps")
+    #[serde(default)]
+    pub dump_dir: Option<PathBuf>,
 }
 
 /// A custom probe: inject specific values into a parameter or body property.
@@ -144,6 +152,8 @@ impl Default for Config {
             response_time_limit: None,
             success_criteria: SuccessCriteria::default(),
             min_success_rate: None,
+            dump: false,
+            dump_dir: None,
         }
     }
 }
@@ -221,6 +231,10 @@ user_id = "1"
 #   "any_response" - record distribution, never fail on status alone
 # success_criteria = "default"
 # min_success_rate = 0.1
+
+# Dump all request/response pairs to JSONL files (default: false)
+# dump = true
+# dump_dir = ".apifuzz/dumps"
 "#
     }
 }
