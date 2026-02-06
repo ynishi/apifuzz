@@ -45,8 +45,8 @@ pub fn save_report(data: &ReportData) -> Result<PathBuf, std::io::Error> {
         "stats": {
             "total": data.output.total,
             "success": data.output.success,
-            "failures": data.output.failure_count,
-            "errors": data.output.errors.len(),
+            "failure": data.output.total.saturating_sub(data.output.success).saturating_sub(data.output.errors.len() as u64),
+            "error": data.output.errors.len(),
         },
         "meta": {
             "timestamp": timestamp_iso(),

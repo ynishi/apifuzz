@@ -61,55 +61,83 @@ impl VerdictPolicy {
         true
     }
 
-    /// Determine final exit code from failures
+    /// Determine final exit code from failures and request counts.
     ///
-    /// Returns the highest exit code among all failures
+    /// Returns the highest exit code among all failures,
+    /// or 3 if there were errors (non-success, non-failure requests).
     #[must_use]
-    pub fn exit_code(&self, failures: &[Failure]) -> i32 {
-        if failures.is_empty() {
-            return 0;
-        }
-
-        failures
+    pub fn exit_code(&self, failures: &[Failure], has_errors: bool) -> i32 {
+        let failure_code = failures
             .iter()
             .map(|f| f.severity.exit_code(self.strict))
             .max()
-            .unwrap_or(0)
+            .unwrap_or(0);
+
+        if failure_code > 0 {
+            return failure_code;
+        }
+
+        // Errors (connection failures, etc.) → exit 3 (tool error)
+        if has_errors {
+            return 3;
+        }
+
+        0
     }
 
-    /// Determine verdict status
+    /// Determine verdict from request counts and classified failures.
+    ///
+    /// PASS requires **all** requests to be Success.
+    /// Any Failure (check violation) or Error (connection/transport) → FAIL.
     #[must_use]
-    pub fn verdict(&self, failures: &[Failure]) -> Verdict {
-        let exit_code = self.exit_code(failures);
-        let status = if exit_code == 0 {
+    pub fn verdict(
+        &self,
+        failures: &[Failure],
+        total: u64,
+        success: u64,
+        error_count: u64,
+    ) -> Verdict {
+        let has_errors = error_count > 0;
+        let exit_code = self.exit_code(failures, has_errors);
+
+        // PASS iff every request succeeded (success == total)
+        let status = if success == total && total > 0 {
             VerdictStatus::Pass
         } else {
             VerdictStatus::Fail
         };
 
-        let reason = if failures.is_empty() {
-            "No failures detected".to_string()
+        let reason = if status == VerdictStatus::Pass {
+            "All requests passed".to_string()
+        } else if total == 0 {
+            "No requests were made".to_string()
         } else {
-            let critical = failures
-                .iter()
-                .filter(|f| f.severity == Severity::Critical)
-                .count();
-            let error = failures
-                .iter()
-                .filter(|f| f.severity == Severity::Error)
-                .count();
-            let warning = failures
-                .iter()
-                .filter(|f| f.severity == Severity::Warning)
-                .count();
-
-            format!(
-                "{} failures: {} critical, {} error, {} warning",
-                failures.len(),
-                critical,
-                error,
-                warning
-            )
+            let mut parts = Vec::new();
+            if !failures.is_empty() {
+                let critical = failures
+                    .iter()
+                    .filter(|f| f.severity == Severity::Critical)
+                    .count();
+                let error = failures
+                    .iter()
+                    .filter(|f| f.severity == Severity::Error)
+                    .count();
+                let warning = failures
+                    .iter()
+                    .filter(|f| f.severity == Severity::Warning)
+                    .count();
+                parts.push(format!(
+                    "{} failures ({} critical, {} error, {} warning)",
+                    failures.len(),
+                    critical,
+                    error,
+                    warning
+                ));
+            }
+            if has_errors {
+                parts.push(format!("{error_count} errors (connection/transport)"));
+            }
+            parts.join("; ")
         };
 
         Verdict {
@@ -117,48 +145,6 @@ impl VerdictPolicy {
             exit_code,
             reason,
         }
-    }
-
-    /// Determine verdict with additional context from the runner.
-    ///
-    /// This is the preferred method when runner metadata is available.
-    /// It catches cases where Schemathesis itself failed (exit_code != 0)
-    /// but no failures were parsed, or no requests were made at all.
-    ///
-    /// Returns exit code 3 for tool errors (distinct from test failures).
-    #[must_use]
-    pub fn verdict_with_context(
-        &self,
-        failures: &[Failure],
-        total_requests: u64,
-        schemathesis_exit_code: i32,
-    ) -> Verdict {
-        // Safety: no requests made at all → tool error
-        if total_requests == 0 {
-            return Verdict {
-                status: VerdictStatus::Fail,
-                exit_code: 3,
-                reason: format!(
-                    "No requests were made. Schemathesis may have failed to start (exit code: {}).",
-                    schemathesis_exit_code
-                ),
-            };
-        }
-
-        // Safety: Schemathesis failed but no parsed failures
-        if schemathesis_exit_code != 0 && failures.is_empty() {
-            return Verdict {
-                status: VerdictStatus::Fail,
-                exit_code: 3,
-                reason: format!(
-                    "Schemathesis exited with code {} but no failures were parsed. Check cassette manually.",
-                    schemathesis_exit_code
-                ),
-            };
-        }
-
-        // Normal verdict path
-        self.verdict(failures)
     }
 }
 
@@ -220,137 +206,134 @@ mod tests {
         assert!(policy.strict);
     }
 
-    #[test]
-    fn empty_failures_returns_pass() {
-        let policy = VerdictPolicy::default();
-        let verdict = policy.verdict(&[]);
+    // --- exit_code tests ---
 
-        assert_eq!(verdict.status, VerdictStatus::Pass);
-        assert_eq!(verdict.exit_code, 0);
+    #[test]
+    fn exit_code_no_failures_no_errors() {
+        let policy = VerdictPolicy::default();
+        assert_eq!(policy.exit_code(&[], false), 0);
     }
 
     #[test]
-    fn critical_failure_returns_exit_2() {
+    fn exit_code_critical_failure() {
         let policy = VerdictPolicy::default();
-        let failures = vec![critical_failure()];
-
-        assert_eq!(policy.exit_code(&failures), 2);
+        assert_eq!(policy.exit_code(&[critical_failure()], false), 2);
     }
 
     #[test]
-    fn warning_in_strict_mode_returns_exit_1() {
+    fn exit_code_warning_strict() {
         let policy = VerdictPolicy::default(); // strict=true
-        let failures = vec![warning_failure()];
-
-        assert_eq!(policy.exit_code(&failures), 1);
+        assert_eq!(policy.exit_code(&[warning_failure()], false), 1);
     }
 
     #[test]
-    fn warning_in_lenient_mode_returns_exit_0() {
+    fn exit_code_warning_lenient() {
         let policy = VerdictPolicy::lenient();
-        let failures = vec![warning_failure()];
-
-        assert_eq!(policy.exit_code(&failures), 0);
+        assert_eq!(policy.exit_code(&[warning_failure()], false), 0);
     }
 
     #[test]
-    fn highest_severity_wins() {
+    fn exit_code_highest_severity_wins() {
         let policy = VerdictPolicy::default();
         let failures = vec![warning_failure(), error_failure(), critical_failure()];
-
-        // Critical (exit 2) should win over Error (1) and Warning (1)
-        assert_eq!(policy.exit_code(&failures), 2);
+        assert_eq!(policy.exit_code(&failures, false), 2);
     }
+
+    #[test]
+    fn exit_code_errors_only_returns_3() {
+        let policy = VerdictPolicy::default();
+        assert_eq!(policy.exit_code(&[], true), 3);
+    }
+
+    #[test]
+    fn exit_code_failures_take_precedence_over_errors() {
+        let policy = VerdictPolicy::default();
+        // critical failure (exit 2) > error (exit 3)? No — failure_code > 0 returns first.
+        assert_eq!(policy.exit_code(&[critical_failure()], true), 2);
+    }
+
+    // --- filter tests ---
 
     #[test]
     fn filter_ignores_specified_status_codes() {
         let mut policy = VerdictPolicy::default();
         policy.ignore_status_codes = vec![500];
-
-        let failures = vec![critical_failure()]; // status 500
-        let filtered = policy.filter(failures);
-
-        assert!(filtered.is_empty());
+        assert!(policy.filter(vec![critical_failure()]).is_empty());
     }
 
     #[test]
     fn filter_ignores_specified_failure_types() {
         let mut policy = VerdictPolicy::default();
         policy.ignore_failure_types = vec![FailureType::ServerError];
-
-        let failures = vec![critical_failure()]; // ServerError
-        let filtered = policy.filter(failures);
-
-        assert!(filtered.is_empty());
+        assert!(policy.filter(vec![critical_failure()]).is_empty());
     }
 
     #[test]
     fn filter_respects_min_severity() {
         let mut policy = VerdictPolicy::default();
         policy.min_severity = Severity::Error;
-
-        let failures = vec![warning_failure()]; // Severity::Warning < Error
-        let filtered = policy.filter(failures);
-
-        assert!(filtered.is_empty());
+        assert!(policy.filter(vec![warning_failure()]).is_empty());
     }
 
+    // --- verdict tests (three-state) ---
+
     #[test]
-    fn verdict_fail_on_any_error() {
+    fn verdict_all_success_is_pass() {
         let policy = VerdictPolicy::default();
-        let failures = vec![error_failure()];
-        let verdict = policy.verdict(&failures);
-
-        assert_eq!(verdict.status, VerdictStatus::Fail);
+        let v = policy.verdict(&[], 100, 100, 0);
+        assert_eq!(v.status, VerdictStatus::Pass);
+        assert_eq!(v.exit_code, 0);
+        assert_eq!(v.reason, "All requests passed");
     }
 
     #[test]
-    fn verdict_reason_includes_counts() {
+    fn verdict_zero_requests_is_fail() {
         let policy = VerdictPolicy::default();
-        let failures = vec![critical_failure(), warning_failure()];
-        let verdict = policy.verdict(&failures);
-
-        assert!(verdict.reason.contains("2 failures"));
-        assert!(verdict.reason.contains("1 critical"));
-        assert!(verdict.reason.contains("1 warning"));
+        let v = policy.verdict(&[], 0, 0, 0);
+        assert_eq!(v.status, VerdictStatus::Fail);
+        assert!(v.reason.contains("No requests were made"));
     }
 
     #[test]
-    fn verdict_with_context_zero_requests_returns_exit_3() {
+    fn verdict_all_errors_is_fail() {
         let policy = VerdictPolicy::default();
-        let verdict = policy.verdict_with_context(&[], 0, 1);
-
-        assert_eq!(verdict.status, VerdictStatus::Fail);
-        assert_eq!(verdict.exit_code, 3);
-        assert!(verdict.reason.contains("No requests were made"));
+        // total=100, success=0, errors=100
+        let v = policy.verdict(&[], 100, 0, 100);
+        assert_eq!(v.status, VerdictStatus::Fail);
+        assert_eq!(v.exit_code, 3);
+        assert!(v.reason.contains("100 errors"));
     }
 
     #[test]
-    fn verdict_with_context_exit_nonzero_no_failures_returns_exit_3() {
-        let policy = VerdictPolicy::default();
-        let verdict = policy.verdict_with_context(&[], 100, 1);
-
-        assert_eq!(verdict.status, VerdictStatus::Fail);
-        assert_eq!(verdict.exit_code, 3);
-        assert!(verdict.reason.contains("no failures were parsed"));
-    }
-
-    #[test]
-    fn verdict_with_context_normal_pass() {
-        let policy = VerdictPolicy::default();
-        let verdict = policy.verdict_with_context(&[], 100, 0);
-
-        assert_eq!(verdict.status, VerdictStatus::Pass);
-        assert_eq!(verdict.exit_code, 0);
-    }
-
-    #[test]
-    fn verdict_with_context_normal_fail() {
+    fn verdict_failures_is_fail() {
         let policy = VerdictPolicy::default();
         let failures = vec![critical_failure()];
-        let verdict = policy.verdict_with_context(&failures, 100, 1);
+        // total=10, success=9, errors=0 (1 failed request)
+        let v = policy.verdict(&failures, 10, 9, 0);
+        assert_eq!(v.status, VerdictStatus::Fail);
+        assert_eq!(v.exit_code, 2);
+        assert!(v.reason.contains("1 failures"));
+        assert!(v.reason.contains("1 critical"));
+    }
 
-        assert_eq!(verdict.status, VerdictStatus::Fail);
-        assert_eq!(verdict.exit_code, 2);
+    #[test]
+    fn verdict_mixed_failures_and_errors() {
+        let policy = VerdictPolicy::default();
+        let failures = vec![error_failure()];
+        // total=100, success=50, errors=20 (30 failed requests)
+        let v = policy.verdict(&failures, 100, 50, 20);
+        assert_eq!(v.status, VerdictStatus::Fail);
+        assert!(v.reason.contains("1 failures"));
+        assert!(v.reason.contains("20 errors"));
+    }
+
+    #[test]
+    fn verdict_reason_includes_severity_counts() {
+        let policy = VerdictPolicy::default();
+        let failures = vec![critical_failure(), warning_failure()];
+        let v = policy.verdict(&failures, 10, 8, 0);
+        assert!(v.reason.contains("2 failures"));
+        assert!(v.reason.contains("1 critical"));
+        assert!(v.reason.contains("1 warning"));
     }
 }

@@ -9,7 +9,7 @@ use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 use apifuzz_core::status;
-use apifuzz_core::{Config, VerdictPolicy, VerdictStatus, classify_failures, to_http_file};
+use apifuzz_core::{Config, VerdictPolicy, classify_failures, to_http_file};
 use apifuzz_runner::{FuzzLevel, NativeRunner};
 
 #[derive(Parser)]
@@ -188,36 +188,8 @@ fn run(cli: Cli) -> Result<i32> {
                 eprintln!();
             }
 
-            // Safety check: no requests made → tool error
-            if output.total == 0 {
-                eprintln!("Error: No requests were made. Check spec and base_url.");
-                if !output.errors.is_empty() {
-                    eprintln!(
-                        "  errors: {}",
-                        output
-                            .errors
-                            .iter()
-                            .take(5)
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join("\n  ")
-                    );
-                }
-                return Ok(3);
-            }
-
             // Convert raw types → Rust verdict types
             let classified = classify_failures(&output);
-
-            // Safety check: failures reported but classification produced nothing
-            if output.failure_count > 0 && classified.is_empty() {
-                eprintln!(
-                    "Warning: {} failures reported but classification produced 0.",
-                    output.failure_count
-                );
-                eprintln!("  This may indicate a parsing issue. Treating as tool error.");
-                return Ok(3);
-            }
 
             // Apply policy
             let policy = VerdictPolicy {
@@ -227,25 +199,26 @@ fn run(cli: Cli) -> Result<i32> {
 
             let filtered = policy.filter(classified);
 
+            // Derive three-state counts: Success / Failure / Error
+            let error_count = u64::try_from(output.errors.len()).unwrap_or(u64::MAX);
+            let failure_requests = output
+                .total
+                .saturating_sub(output.success)
+                .saturating_sub(error_count);
+
             // Status code distribution statistics (informational only)
             let status_analysis = status::analyze(&output.interactions);
 
-            let verdict = policy.verdict(&filtered);
+            let verdict = policy.verdict(&filtered, output.total, output.success, error_count);
 
             // Output
             match cli.output {
                 OutputFormat::Terminal => {
-                    let icon = if verdict.status == VerdictStatus::Pass {
-                        "PASS"
-                    } else {
-                        "FAIL"
-                    };
-                    println!("\n{icon}: {}", verdict.reason);
+                    println!("\n{}: {}", verdict.status, verdict.reason);
                     println!(
-                        "  Requests: {} total, {} success, {} failures",
-                        output.total, output.success, output.failure_count
+                        "  Requests: {} total | {} success | {} failure | {} error",
+                        output.total, output.success, failure_requests, error_count
                     );
-                    println!("  Exit code: {}", verdict.exit_code);
 
                     // Status distribution per operation
                     if !status_analysis.operations.is_empty() {
@@ -304,7 +277,8 @@ fn run(cli: Cli) -> Result<i32> {
                         "stats": {
                             "total": output.total,
                             "success": output.success,
-                            "failures": output.failure_count,
+                            "failure": failure_requests,
+                            "error": error_count,
                         },
                         "status_analysis": {
                             "global": status_analysis.global,
