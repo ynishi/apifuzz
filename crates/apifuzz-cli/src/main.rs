@@ -60,6 +60,14 @@ enum Commands {
         /// Directory for dump files (default: .apifuzz/dumps)
         #[arg(long)]
         dump_dir: Option<String>,
+
+        /// Stop on first failure detection (fast-fail for CI)
+        #[arg(long)]
+        stop_on_failure: bool,
+
+        /// Max requests per operation (across all phases)
+        #[arg(long)]
+        limit: Option<u32>,
     },
 
     /// Initialize config file
@@ -129,6 +137,8 @@ fn run(cli: Cli) -> Result<i32> {
             dry_run,
             dump,
             dump_dir,
+            stop_on_failure,
+            limit,
         } => {
             // Load config
             let cfg = if let Some(path) = config {
@@ -137,7 +147,10 @@ fn run(cli: Cli) -> Result<i32> {
                 Config::load_default()?
             };
 
-            let runner = NativeRunner::from_config(&cfg).with_level(level.into());
+            let runner = NativeRunner::from_config(&cfg)
+                .with_level(level.into())
+                .with_stop_on_failure(stop_on_failure)
+                .with_limit(limit);
 
             // Dry run: show plan and exit
             if dry_run {

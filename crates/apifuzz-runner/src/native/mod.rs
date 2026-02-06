@@ -134,6 +134,10 @@ pub struct NativeRunner {
     probes: Vec<Probe>,
     response_time_limit: Option<f64>,
     level: FuzzLevel,
+    /// Stop on first failure detection
+    stop_on_failure: bool,
+    /// Per-operation request limit (across all phases)
+    limit: Option<u32>,
 }
 
 impl NativeRunner {
@@ -147,12 +151,26 @@ impl NativeRunner {
             probes: config.probes.clone(),
             response_time_limit: config.response_time_limit,
             level: FuzzLevel::default(),
+            stop_on_failure: false,
+            limit: None,
         }
     }
 
     #[must_use]
     pub fn with_level(mut self, level: FuzzLevel) -> Self {
         self.level = level;
+        self
+    }
+
+    #[must_use]
+    pub fn with_stop_on_failure(mut self, stop: bool) -> Self {
+        self.stop_on_failure = stop;
+        self
+    }
+
+    #[must_use]
+    pub fn with_limit(mut self, limit: Option<u32>) -> Self {
+        self.limit = limit;
         self
     }
 
@@ -326,13 +344,23 @@ impl NativeRunner {
             random_count
         );
 
-        for op in &operations {
+        let mut stopped_early = false;
+
+        'ops: for op in &operations {
             let op_label = format!("{} {}", op.method, op.path);
+            let mut op_count: u32 = 0;
+
+            // Helper macro-like closure to check limits
+            let limit = self.limit;
+            let stop_on_failure = self.stop_on_failure;
 
             // Phase 0: Custom probes (user-defined known-bug patterns)
             let probe_cases = collect_probe_cases(op, &self.probes);
             let mut pr = PhaseStats::default();
             for ov in &probe_cases {
+                if limit.is_some_and(|l| op_count >= l) {
+                    break;
+                }
                 let r = self.execute_one(
                     &client,
                     op,
@@ -342,13 +370,22 @@ impl NativeRunner {
                     FuzzPhase::Probe,
                     &mut acc.seen_spec_gaps,
                 );
-                pr.record(acc.record(r, &op_label, "probe"));
+                let failed = acc.record(r, &op_label, "probe");
+                pr.record(failed);
+                op_count += 1;
+                if stop_on_failure && failed {
+                    stopped_early = true;
+                    break 'ops;
+                }
             }
 
             // Phase 1: Fixed boundary (deterministic)
             let boundary_cases = collect_boundary_cases(op, &components);
             let mut p1 = PhaseStats::default();
             for ov in &boundary_cases {
+                if limit.is_some_and(|l| op_count >= l) {
+                    break;
+                }
                 let r = self.execute_one(
                     &client,
                     op,
@@ -358,13 +395,22 @@ impl NativeRunner {
                     FuzzPhase::Boundary,
                     &mut acc.seen_spec_gaps,
                 );
-                p1.record(acc.record(r, &op_label, "boundary"));
+                let failed = acc.record(r, &op_label, "boundary");
+                p1.record(failed);
+                op_count += 1;
+                if stop_on_failure && failed {
+                    stopped_early = true;
+                    break 'ops;
+                }
             }
 
             // Phase 1b: Type confusion (deterministic)
             let tc_cases = collect_type_confusion_cases(op, &components);
             let mut tc = PhaseStats::default();
             for ov in &tc_cases {
+                if limit.is_some_and(|l| op_count >= l) {
+                    break;
+                }
                 let r = self.execute_one(
                     &client,
                     op,
@@ -374,12 +420,21 @@ impl NativeRunner {
                     FuzzPhase::TypeConfusion,
                     &mut acc.seen_spec_gaps,
                 );
-                tc.record(acc.record(r, &op_label, "type-confusion"));
+                let failed = acc.record(r, &op_label, "type-confusion");
+                tc.record(failed);
+                op_count += 1;
+                if stop_on_failure && failed {
+                    stopped_early = true;
+                    break 'ops;
+                }
             }
 
             // Phase 2: Boundary neighborhood random
             let mut p2 = PhaseStats::default();
             for _ in 0..neighborhood_count {
+                if limit.is_some_and(|l| op_count >= l) {
+                    break;
+                }
                 let overrides = generate_neighborhood_override(op, &components, &mut rng);
                 let ov = if overrides.params.is_empty() && overrides.body_props.is_empty() {
                     None
@@ -395,12 +450,21 @@ impl NativeRunner {
                     FuzzPhase::Neighborhood,
                     &mut acc.seen_spec_gaps,
                 );
-                p2.record(acc.record(r, &op_label, "neighborhood"));
+                let failed = acc.record(r, &op_label, "neighborhood");
+                p2.record(failed);
+                op_count += 1;
+                if stop_on_failure && failed {
+                    stopped_early = true;
+                    break 'ops;
+                }
             }
 
             // Phase 3: Full random
             let mut p3 = PhaseStats::default();
             for _ in 0..random_count {
+                if limit.is_some_and(|l| op_count >= l) {
+                    break;
+                }
                 let r = self.execute_one(
                     &client,
                     op,
@@ -410,7 +474,13 @@ impl NativeRunner {
                     FuzzPhase::Random,
                     &mut acc.seen_spec_gaps,
                 );
-                p3.record(acc.record(r, &op_label, "random"));
+                let failed = acc.record(r, &op_label, "random");
+                p3.record(failed);
+                op_count += 1;
+                if stop_on_failure && failed {
+                    stopped_early = true;
+                    break 'ops;
+                }
             }
 
             let total_fail = pr.fail + p1.fail + tc.fail + p2.fail + p3.fail;
@@ -421,8 +491,8 @@ impl NativeRunner {
                     String::new()
                 };
                 eprintln!(
-                    "  {op_label}: {total_fail} failures ({probe_str}fixed {}/{}, type {}/{}, near {}/{neighborhood_count}, rand {}/{random_count})",
-                    p1.fail, p1.total, tc.fail, tc.total, p2.fail, p3.fail
+                    "  {op_label}: {total_fail} failures ({probe_str}fixed {}/{}, type {}/{}, near {}/{}, rand {}/{})",
+                    p1.fail, p1.total, tc.fail, tc.total, p2.fail, p2.total, p3.fail, p3.total
                 );
             } else {
                 let probe_str = if pr.total > 0 {
@@ -431,10 +501,14 @@ impl NativeRunner {
                     String::new()
                 };
                 eprintln!(
-                    "  {op_label}: OK ({probe_str}{} fixed + {} type + {neighborhood_count} near + {random_count} rand)",
-                    p1.total, tc.total
+                    "  {op_label}: OK ({probe_str}{} fixed + {} type + {} near + {} rand)",
+                    p1.total, tc.total, p2.total, p3.total
                 );
             }
+        }
+
+        if stopped_early {
+            eprintln!("Stopped early: failure detected (--stop-on-failure)");
         }
 
         Ok(acc.into_output())
