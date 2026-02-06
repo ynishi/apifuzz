@@ -36,6 +36,7 @@ rand = { version = "0.8", features = ["small_rng"] }
 
 # Validation
 jsonschema = "0.41"
+serde_yml = "0.0.12"
 
 # Testing
 insta = { version = "1", features = ["yaml"] }

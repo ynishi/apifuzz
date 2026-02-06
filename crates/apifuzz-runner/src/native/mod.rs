@@ -164,8 +164,7 @@ impl NativeRunner {
     pub fn run(&self) -> Result<SchemathesisOutput, NativeError> {
         let spec_content = std::fs::read_to_string(&self.spec_path)
             .map_err(|e| NativeError::Io(format!("{}: {e}", self.spec_path.display())))?;
-        let spec: serde_json::Value = serde_json::from_str(&spec_content)
-            .map_err(|e| NativeError::Parse(format!("Invalid JSON: {e}")))?;
+        let spec: serde_json::Value = parse_spec(&self.spec_path, &spec_content)?;
 
         let components = spec
             .get("components")
@@ -512,6 +511,35 @@ impl NativeRunner {
         };
 
         Ok((interaction, failures))
+    }
+}
+
+/// Parse an OpenAPI spec from JSON or YAML.
+///
+/// Detection strategy: try extension first (`.yaml`/`.yml`), then fall back to
+/// content sniffing (leading `{` → JSON, otherwise YAML).
+fn parse_spec(path: &std::path::Path, content: &str) -> Result<serde_json::Value, NativeError> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    match ext.as_str() {
+        "yaml" | "yml" => serde_yml::from_str(content)
+            .map_err(|e| NativeError::Parse(format!("Invalid YAML: {e}"))),
+        "json" => serde_json::from_str(content)
+            .map_err(|e| NativeError::Parse(format!("Invalid JSON: {e}"))),
+        _ => {
+            // Content sniffing: trimmed first char
+            if content.trim_start().starts_with('{') {
+                serde_json::from_str(content)
+                    .map_err(|e| NativeError::Parse(format!("Invalid JSON: {e}")))
+            } else {
+                serde_yml::from_str(content)
+                    .map_err(|e| NativeError::Parse(format!("Invalid YAML: {e}")))
+            }
+        }
     }
 }
 
@@ -1122,6 +1150,61 @@ mod tests {
         assert!(has_type(&f, "ResponseTimeExceeded"), "Check 4");
         assert!(has_type(&f, "SchemaViolation"), "Check 5");
         assert!(has_type(&f, "ContentTypeMismatch"), "Check 6");
+    }
+
+    // ═══════════════════════════════════════════
+    // parse_spec: JSON / YAML / content sniffing
+    // ═══════════════════════════════════════════
+
+    #[test]
+    fn parse_spec_json_by_extension() {
+        let json = r#"{"openapi": "3.1.0", "info": {"title": "T", "version": "1"}}"#;
+        let v = parse_spec(std::path::Path::new("spec.json"), json).unwrap();
+        assert_eq!(v["openapi"], "3.1.0");
+    }
+
+    #[test]
+    fn parse_spec_yaml_by_extension() {
+        let yaml = "openapi: '3.1.0'\ninfo:\n  title: T\n  version: '1'\n";
+        let v = parse_spec(std::path::Path::new("spec.yaml"), yaml).unwrap();
+        assert_eq!(v["openapi"], "3.1.0");
+    }
+
+    #[test]
+    fn parse_spec_yml_by_extension() {
+        let yaml = "openapi: '3.1.0'\ninfo:\n  title: T\n  version: '1'\n";
+        let v = parse_spec(std::path::Path::new("spec.yml"), yaml).unwrap();
+        assert_eq!(v["openapi"], "3.1.0");
+    }
+
+    #[test]
+    fn parse_spec_sniff_json() {
+        let json = r#"{"openapi": "3.1.0"}"#;
+        let v = parse_spec(std::path::Path::new("spec"), json).unwrap();
+        assert_eq!(v["openapi"], "3.1.0");
+    }
+
+    #[test]
+    fn parse_spec_sniff_yaml() {
+        let yaml = "openapi: '3.1.0'\n";
+        let v = parse_spec(std::path::Path::new("spec.txt"), yaml).unwrap();
+        assert_eq!(v["openapi"], "3.1.0");
+    }
+
+    #[test]
+    fn parse_spec_invalid_json_error() {
+        let bad = "{ invalid json";
+        let err = parse_spec(std::path::Path::new("spec.json"), bad);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("Invalid JSON"));
+    }
+
+    #[test]
+    fn parse_spec_invalid_yaml_error() {
+        let bad = ":\n  :\n    - [invalid";
+        let err = parse_spec(std::path::Path::new("spec.yaml"), bad);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("Invalid YAML"));
     }
 
     #[test]
