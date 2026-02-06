@@ -9,7 +9,7 @@ use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 use apifuzz_core::status;
-use apifuzz_core::{Config, VerdictPolicy, VerdictStatus, classify_failures, to_http_file};
+use apifuzz_core::{classify_failures, to_http_file, Config, VerdictPolicy, VerdictStatus};
 use apifuzz_runner::{FuzzLevel, NativeRunner};
 
 #[derive(Parser)]
@@ -61,11 +61,15 @@ enum Commands {
         #[arg(long)]
         dump_dir: Option<String>,
 
+        /// Neighborhood+random iterations per operation (overrides --level)
+        #[arg(short = 'n', long = "examples")]
+        examples: Option<u32>,
+
         /// Stop on first failure detection (fast-fail for CI)
         #[arg(long)]
         stop_on_failure: bool,
 
-        /// Max requests per operation (across all phases)
+        /// Max requests per operation across all phases (hard cap)
         #[arg(long)]
         limit: Option<u32>,
     },
@@ -128,6 +132,7 @@ fn run(cli: Cli) -> Result<i32> {
             dry_run,
             dump,
             dump_dir,
+            examples,
             stop_on_failure,
             limit,
         } => {
@@ -140,6 +145,7 @@ fn run(cli: Cli) -> Result<i32> {
 
             let runner = NativeRunner::from_config(&cfg)
                 .with_level(level.into())
+                .with_examples(examples)
                 .with_stop_on_failure(stop_on_failure)
                 .with_limit(limit);
 

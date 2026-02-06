@@ -19,13 +19,13 @@ use apifuzz_core::{Config, Probe};
 
 use crate::datagen;
 
-use checks::CheckInput;
 use checks::run_checks;
+use checks::CheckInput;
 use phases::{
-    FuzzPhase, Overrides, collect_boundary_cases, collect_probe_cases,
-    collect_type_confusion_cases, generate_neighborhood_override,
+    collect_boundary_cases, collect_probe_cases, collect_type_confusion_cases,
+    generate_neighborhood_override, FuzzPhase, Overrides,
 };
-use spec::{Operation, ParamLocation, extract_operations};
+use spec::{extract_operations, Operation, ParamLocation};
 
 /// Fuzz intensity level
 #[derive(Debug, Clone, Copy, Default)]
@@ -151,6 +151,8 @@ pub struct NativeRunner {
     probes: Vec<Probe>,
     response_time_limit: Option<f64>,
     level: FuzzLevel,
+    /// Override neighborhood+random count (takes precedence over level)
+    examples: Option<u32>,
     /// Stop on first failure detection
     stop_on_failure: bool,
     /// Per-operation request limit (across all phases)
@@ -168,6 +170,7 @@ impl NativeRunner {
             probes: config.probes.clone(),
             response_time_limit: config.response_time_limit,
             level: FuzzLevel::default(),
+            examples: None,
             stop_on_failure: false,
             limit: None,
         }
@@ -176,6 +179,12 @@ impl NativeRunner {
     #[must_use]
     pub fn with_level(mut self, level: FuzzLevel) -> Self {
         self.level = level;
+        self
+    }
+
+    #[must_use]
+    pub fn with_examples(mut self, examples: Option<u32>) -> Self {
+        self.examples = examples;
         self
     }
 
@@ -217,7 +226,7 @@ impl NativeRunner {
 
         let operations = extract_operations(&spec);
 
-        let max_examples = self.level.max_examples();
+        let max_examples = self.examples.unwrap_or_else(|| self.level.max_examples());
         let neighborhood_count = max_examples / 3;
         let random_count = max_examples - neighborhood_count;
 
@@ -346,7 +355,7 @@ impl NativeRunner {
             .map_err(|e| NativeError::Http(e.to_string()))?;
 
         let mut rng = SmallRng::from_entropy();
-        let max_examples = self.level.max_examples();
+        let max_examples = self.examples.unwrap_or_else(|| self.level.max_examples());
         let mut acc = FuzzAccumulator::new();
 
         let neighborhood_count = max_examples / 3;
@@ -801,8 +810,8 @@ pub enum NativeError {
 mod tests {
     use super::*;
 
-    use checks::CheckInput;
     use checks::run_checks;
+    use checks::CheckInput;
     use phases::FuzzPhase;
     use spec::Operation;
 
