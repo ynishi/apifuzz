@@ -1,14 +1,14 @@
-//! Status code distribution analysis and pattern detection
+//! Status code distribution statistics
 //!
-//! Computes per-operation and global status code distributions from fuzz results,
-//! then applies the configured [`SuccessCriteria`] to produce warnings or failures.
+//! Computes per-operation and global status code distributions from fuzz results.
+//! Pure statistics — no verdict logic. Individual status expectations are now
+//! handled by `StatusSatisfyExpectation` checks in the runner.
 
 use std::collections::HashMap;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::config::SuccessCriteria;
 use crate::schema::RawInteraction;
 
 // ── Data types ──
@@ -26,64 +26,6 @@ pub struct OperationStats {
     pub success_rate: f64,
 }
 
-/// Kind of issue detected from status code patterns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum StatusWarningKind {
-    /// All (or nearly all) responses are 401/403
-    AuthenticationIssue,
-    /// All (or nearly all) responses are 429
-    RateLimited,
-    /// All (or nearly all) responses are 404
-    EndpointNotFound,
-    /// Zero 2xx responses (no specific pattern detected)
-    NoSuccessfulResponses,
-    /// 2xx rate below configured threshold (require_2xx mode)
-    LowSuccessRate,
-}
-
-impl StatusWarningKind {
-    /// Whether this warning should be treated as a failure under strict mode.
-    #[must_use]
-    pub const fn is_failure_in_require_2xx(self) -> bool {
-        matches!(
-            self,
-            Self::AuthenticationIssue
-                | Self::RateLimited
-                | Self::EndpointNotFound
-                | Self::NoSuccessfulResponses
-                | Self::LowSuccessRate
-        )
-    }
-}
-
-impl std::fmt::Display for StatusWarningKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AuthenticationIssue => write!(f, "authentication may be invalid"),
-            Self::RateLimited => write!(f, "rate limited — consider adding delay"),
-            Self::EndpointNotFound => {
-                write!(f, "endpoint not found — check base_url or spec paths")
-            }
-            Self::NoSuccessfulResponses => write!(f, "no successful responses"),
-            Self::LowSuccessRate => write!(f, "success rate below threshold"),
-        }
-    }
-}
-
-/// A warning about a specific operation's status code pattern.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct StatusWarning {
-    /// Operation label
-    pub operation: String,
-    /// What kind of issue was detected
-    pub kind: StatusWarningKind,
-    /// Human-readable message
-    pub message: String,
-    /// Whether this should be treated as a failure (depends on criteria)
-    pub is_failure: bool,
-}
-
 /// Global summary statistics.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GlobalStats {
@@ -99,11 +41,17 @@ pub struct StatusAnalysis {
     pub operations: Vec<OperationStats>,
     /// Global aggregated statistics
     pub global: GlobalStats,
-    /// Warnings and failures detected from patterns
-    pub warnings: Vec<StatusWarning>,
 }
 
 // ── Computation ──
+
+/// Compute status code statistics from raw interactions.
+#[must_use]
+pub fn analyze(interactions: &[RawInteraction]) -> StatusAnalysis {
+    let operations = compute_operation_stats(interactions);
+    let global = compute_global_stats(&operations);
+    StatusAnalysis { operations, global }
+}
 
 /// Compute per-operation status code statistics from raw interactions.
 #[must_use]
@@ -174,141 +122,7 @@ pub fn compute_global_stats(op_stats: &[OperationStats]) -> GlobalStats {
     }
 }
 
-// ── Pattern detection ──
-
-/// Minimum fraction of responses that must share a pattern to trigger a warning.
-const PATTERN_THRESHOLD_PERCENT: u64 = 90;
-
-/// Detect the dominant status code pattern for an operation.
-///
-/// Returns `Some(kind)` if ≥[`PATTERN_THRESHOLD_PERCENT`]% of responses share
-/// a recognizable pattern.
-fn detect_pattern(stats: &OperationStats) -> Option<StatusWarningKind> {
-    if stats.total == 0 {
-        return None;
-    }
-
-    // Integer-only ceiling: ⌈total * 90/100⌉
-    let threshold = (stats.total * PATTERN_THRESHOLD_PERCENT).div_ceil(100);
-
-    let auth_count: u64 = stats
-        .status_distribution
-        .iter()
-        .filter(|&(&code, _)| code == 401 || code == 403)
-        .map(|(_, &c)| c)
-        .sum();
-    if auth_count >= threshold {
-        return Some(StatusWarningKind::AuthenticationIssue);
-    }
-
-    let rate_limit_count: u64 = stats.status_distribution.get(&429).copied().unwrap_or(0);
-    if rate_limit_count >= threshold {
-        return Some(StatusWarningKind::RateLimited);
-    }
-
-    let not_found_count: u64 = stats.status_distribution.get(&404).copied().unwrap_or(0);
-    if not_found_count >= threshold {
-        return Some(StatusWarningKind::EndpointNotFound);
-    }
-
-    // No specific pattern, but no 2xx at all
-    if stats.success_rate == 0.0 {
-        return Some(StatusWarningKind::NoSuccessfulResponses);
-    }
-
-    None
-}
-
-// ── Main analysis entry point ──
-
-/// Analyze status code distributions and produce warnings/failures.
-///
-/// This is the main entry point. It computes stats, detects patterns,
-/// and applies the configured success criteria to determine severity.
-#[must_use]
-pub fn analyze(
-    interactions: &[RawInteraction],
-    criteria: SuccessCriteria,
-    min_success_rate: Option<f64>,
-) -> StatusAnalysis {
-    let operations = compute_operation_stats(interactions);
-    let global = compute_global_stats(&operations);
-    let mut warnings = Vec::new();
-
-    let effective_min_rate = min_success_rate.unwrap_or(0.1);
-
-    for op in &operations {
-        match criteria {
-            SuccessCriteria::AnyResponse => {
-                // Record stats only — no warnings
-            }
-            SuccessCriteria::Default => {
-                if let Some(kind) = detect_pattern(op) {
-                    warnings.push(StatusWarning {
-                        operation: op.operation.clone(),
-                        kind,
-                        message: format!(
-                            "{}: {} ({}% 2xx, {}/{})",
-                            op.operation,
-                            kind,
-                            format_pct(op.success_rate),
-                            count_2xx(op),
-                            op.total,
-                        ),
-                        is_failure: false, // warnings only in default mode
-                    });
-                }
-            }
-            SuccessCriteria::Require2xx => {
-                // First check for specific patterns
-                if let Some(kind) = detect_pattern(op) {
-                    warnings.push(StatusWarning {
-                        operation: op.operation.clone(),
-                        kind,
-                        message: format!(
-                            "{}: {} ({}% 2xx, {}/{})",
-                            op.operation,
-                            kind,
-                            format_pct(op.success_rate),
-                            count_2xx(op),
-                            op.total,
-                        ),
-                        is_failure: true,
-                    });
-                } else if op.success_rate < effective_min_rate {
-                    // Below threshold but no specific pattern
-                    warnings.push(StatusWarning {
-                        operation: op.operation.clone(),
-                        kind: StatusWarningKind::LowSuccessRate,
-                        message: format!(
-                            "{}: success rate {}% below threshold {}% ({}/{})",
-                            op.operation,
-                            format_pct(op.success_rate),
-                            format_pct(effective_min_rate),
-                            count_2xx(op),
-                            op.total,
-                        ),
-                        is_failure: true,
-                    });
-                }
-            }
-        }
-    }
-
-    StatusAnalysis {
-        operations,
-        global,
-        warnings,
-    }
-}
-
-fn count_2xx(op: &OperationStats) -> u64 {
-    op.status_distribution
-        .iter()
-        .filter(|&(&code, _)| (200..300).contains(&code))
-        .map(|(_, &c)| c)
-        .sum()
-}
+// ── Format helpers ──
 
 /// Format a rate (0.0–1.0) as a percentage string.
 ///
@@ -419,143 +233,26 @@ mod tests {
         assert!((global.success_rate - 0.7).abs() < 0.01);
     }
 
-    // ── detect_pattern ──
+    // ── analyze ──
 
     #[test]
-    fn detect_auth_pattern() {
-        let data = interactions_uniform("POST /api", 401, 100);
-        let stats = &compute_operation_stats(&data)[0];
-        assert_eq!(
-            detect_pattern(stats),
-            Some(StatusWarningKind::AuthenticationIssue)
-        );
-    }
-
-    #[test]
-    fn detect_auth_pattern_403() {
-        let data = interactions_uniform("POST /api", 403, 50);
-        let stats = &compute_operation_stats(&data)[0];
-        assert_eq!(
-            detect_pattern(stats),
-            Some(StatusWarningKind::AuthenticationIssue)
-        );
-    }
-
-    #[test]
-    fn detect_auth_mixed_401_403() {
-        let data = interactions_mixed("POST /api", &[(401, 45), (403, 50), (200, 5)]);
-        let stats = &compute_operation_stats(&data)[0];
-        // 95/100 = 95% are auth → should detect
-        assert_eq!(
-            detect_pattern(stats),
-            Some(StatusWarningKind::AuthenticationIssue)
-        );
-    }
-
-    #[test]
-    fn detect_rate_limit_pattern() {
-        let data = interactions_uniform("POST /api", 429, 100);
-        let stats = &compute_operation_stats(&data)[0];
-        assert_eq!(detect_pattern(stats), Some(StatusWarningKind::RateLimited));
-    }
-
-    #[test]
-    fn detect_not_found_pattern() {
-        let data = interactions_uniform("GET /missing", 404, 100);
-        let stats = &compute_operation_stats(&data)[0];
-        assert_eq!(
-            detect_pattern(stats),
-            Some(StatusWarningKind::EndpointNotFound)
-        );
-    }
-
-    #[test]
-    fn detect_no_success_generic() {
-        // All 422 — no specific pattern, but 0% 2xx
-        let data = interactions_uniform("POST /api", 422, 100);
-        let stats = &compute_operation_stats(&data)[0];
-        assert_eq!(
-            detect_pattern(stats),
-            Some(StatusWarningKind::NoSuccessfulResponses)
-        );
-    }
-
-    #[test]
-    fn detect_no_pattern_healthy() {
+    fn analyze_returns_stats() {
         let data = interactions_mixed("POST /api", &[(200, 80), (400, 20)]);
-        let stats = &compute_operation_stats(&data)[0];
-        assert_eq!(detect_pattern(stats), None);
-    }
-
-    #[test]
-    fn detect_below_threshold_no_pattern() {
-        // 80% are 401 — below 90% threshold
-        let data = interactions_mixed("POST /api", &[(401, 80), (200, 20)]);
-        let stats = &compute_operation_stats(&data)[0];
-        assert_eq!(detect_pattern(stats), None);
-    }
-
-    // ── analyze: Default criteria ──
-
-    #[test]
-    fn analyze_default_all_401_warns() {
-        let data = interactions_uniform("POST /api", 401, 100);
-        let result = analyze(&data, SuccessCriteria::Default, None);
-        assert_eq!(result.warnings.len(), 1);
-        assert_eq!(
-            result.warnings[0].kind,
-            StatusWarningKind::AuthenticationIssue
-        );
-        assert!(!result.warnings[0].is_failure);
-    }
-
-    #[test]
-    fn analyze_default_healthy_no_warnings() {
-        let data = interactions_mixed("POST /api", &[(200, 80), (400, 20)]);
-        let result = analyze(&data, SuccessCriteria::Default, None);
-        assert!(result.warnings.is_empty());
-    }
-
-    // ── analyze: Require2xx criteria ──
-
-    #[test]
-    fn analyze_require2xx_all_401_is_failure() {
-        let data = interactions_uniform("POST /api", 401, 100);
-        let result = analyze(&data, SuccessCriteria::Require2xx, Some(0.1));
-        assert_eq!(result.warnings.len(), 1);
-        assert_eq!(
-            result.warnings[0].kind,
-            StatusWarningKind::AuthenticationIssue
-        );
-        assert!(result.warnings[0].is_failure);
-    }
-
-    #[test]
-    fn analyze_require2xx_low_rate_is_failure() {
-        let data = interactions_mixed("POST /api", &[(200, 5), (400, 95)]);
-        let result = analyze(&data, SuccessCriteria::Require2xx, Some(0.1));
-        assert_eq!(result.warnings.len(), 1);
-        assert_eq!(result.warnings[0].kind, StatusWarningKind::LowSuccessRate);
-        assert!(result.warnings[0].is_failure);
-    }
-
-    #[test]
-    fn analyze_require2xx_above_threshold_ok() {
-        let data = interactions_mixed("POST /api", &[(200, 50), (400, 50)]);
-        let result = analyze(&data, SuccessCriteria::Require2xx, Some(0.1));
-        assert!(result.warnings.is_empty());
-    }
-
-    // ── analyze: AnyResponse criteria ──
-
-    #[test]
-    fn analyze_any_response_never_warns() {
-        let data = interactions_uniform("POST /api", 401, 100);
-        let result = analyze(&data, SuccessCriteria::AnyResponse, None);
-        assert!(result.warnings.is_empty());
-        // But stats are still computed
+        let result = analyze(&data);
         assert_eq!(result.operations.len(), 1);
         assert_eq!(result.global.total, 100);
+        assert!((result.global.success_rate - 0.8).abs() < 0.01);
+    }
+
+    #[test]
+    fn analyze_multi_operation() {
+        let mut data = interactions_uniform("GET /health", 200, 50);
+        data.extend(interactions_uniform("POST /api", 401, 100));
+        let result = analyze(&data);
+
+        assert_eq!(result.operations.len(), 2);
+        assert_eq!(result.global.total, 150);
+        assert!((result.global.success_rate - 50.0 / 150.0).abs() < 0.01);
     }
 
     // ── format helpers ──
@@ -575,22 +272,5 @@ mod tests {
         assert_eq!(format_pct(1.0), "100");
         assert_eq!(format_pct(0.5), "50.0");
         assert_eq!(format_pct(0.123), "12.3");
-    }
-
-    // ── multi-operation analysis ──
-
-    #[test]
-    fn analyze_multi_operation_mixed() {
-        let mut data = interactions_uniform("GET /health", 200, 50);
-        data.extend(interactions_uniform("POST /api", 401, 100));
-        let result = analyze(&data, SuccessCriteria::Default, None);
-
-        // Only POST /api should warn
-        assert_eq!(result.warnings.len(), 1);
-        assert_eq!(result.warnings[0].operation, "POST /api");
-
-        // Global stats cover both
-        assert_eq!(result.global.total, 150);
-        assert!((result.global.success_rate - 50.0 / 150.0).abs() < 0.01);
     }
 }

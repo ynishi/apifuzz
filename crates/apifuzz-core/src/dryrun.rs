@@ -288,7 +288,6 @@ impl DryRunPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::SuccessCriteria;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -300,8 +299,6 @@ mod tests {
             path_params: HashMap::new(),
             probes: vec![],
             response_time_limit: None,
-            success_criteria: SuccessCriteria::Default,
-            min_success_rate: None,
             dump: false,
             dump_dir: None,
         }

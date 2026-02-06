@@ -4,29 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// How to evaluate success based on HTTP status codes.
-///
-/// Controls whether status code distribution triggers warnings or failures.
-///
-/// ```toml
-/// # .apifuzz.toml
-/// success_criteria = "default"       # warn on 2xx=0%, detect auth/rate-limit patterns
-/// success_criteria = "require_2xx"   # fail if 2xx rate < min_success_rate
-/// success_criteria = "any_response"  # record distribution, never fail on status alone
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SuccessCriteria {
-    /// Warn on 2xx = 0% and auto-detect patterns (all-401 → auth issue, etc.)
-    #[default]
-    Default,
-    /// Require a minimum 2xx success rate; below threshold triggers failure
-    #[serde(rename = "require_2xx")]
-    Require2xx,
-    /// Record status distribution but never fail on status code patterns alone
-    AnyResponse,
-}
-
 /// Project configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -51,15 +28,6 @@ pub struct Config {
     /// Response time limit in seconds (optional, disabled by default)
     #[serde(default)]
     pub response_time_limit: Option<f64>,
-
-    /// How to evaluate success based on HTTP status codes
-    #[serde(default)]
-    pub success_criteria: SuccessCriteria,
-
-    /// Minimum 2xx success rate (0.0–1.0). Only used with `require_2xx`.
-    /// Default: 0.1 (10%)
-    #[serde(default)]
-    pub min_success_rate: Option<f64>,
 
     /// Dump all request/response pairs to JSONL files
     #[serde(default)]
@@ -150,8 +118,6 @@ impl Default for Config {
             path_params: HashMap::new(),
             probes: Vec::new(),
             response_time_limit: None,
-            success_criteria: SuccessCriteria::default(),
-            min_success_rate: None,
             dump: false,
             dump_dir: None,
         }
@@ -224,13 +190,6 @@ user_id = "1"
 
 # Response time limit in seconds (disabled by default)
 # response_time_limit = 5.0
-
-# Success criteria for status code evaluation:
-#   "default"      - warn on 2xx=0%, auto-detect auth/rate-limit patterns
-#   "require_2xx"  - fail if 2xx rate < min_success_rate (default 10%)
-#   "any_response" - record distribution, never fail on status alone
-# success_criteria = "default"
-# min_success_rate = 0.1
 
 # Dump all request/response pairs to JSONL files (default: false)
 # dump = true
@@ -368,18 +327,8 @@ bool = [true]
     }
 
     #[test]
-    fn parse_toml_success_criteria_default() {
-        let toml = r#"
-spec = "api.yaml"
-base_url = "http://localhost:3000"
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.success_criteria, SuccessCriteria::Default);
-        assert_eq!(config.min_success_rate, None);
-    }
-
-    #[test]
-    fn parse_toml_success_criteria_require_2xx() {
+    fn parse_toml_ignores_legacy_success_criteria() {
+        // Existing configs may still have success_criteria — serde ignores unknown fields
         let toml = r#"
 spec = "api.yaml"
 base_url = "http://localhost:3000"
@@ -387,18 +336,6 @@ success_criteria = "require_2xx"
 min_success_rate = 0.2
 "#;
         let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.success_criteria, SuccessCriteria::Require2xx);
-        assert_eq!(config.min_success_rate, Some(0.2));
-    }
-
-    #[test]
-    fn parse_toml_success_criteria_any_response() {
-        let toml = r#"
-spec = "api.yaml"
-base_url = "http://localhost:3000"
-success_criteria = "any_response"
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.success_criteria, SuccessCriteria::AnyResponse);
+        assert_eq!(config.base_url, "http://localhost:3000");
     }
 }

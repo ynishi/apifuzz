@@ -12,13 +12,13 @@ pub mod schema;
 pub mod status;
 pub mod verdict;
 
-pub use config::{Config, ConfigError, Probe, SuccessCriteria};
+pub use config::{Config, ConfigError, Probe};
 pub use convert::classify_failures;
 pub use dryrun::DryRunPlan;
 pub use dump::{DumpError, DumpIndex};
 pub use generator::to_http_file;
 pub use schema::SchemathesisOutput;
-pub use status::{StatusAnalysis, StatusWarning, StatusWarningKind};
+pub use status::StatusAnalysis;
 pub use verdict::{
     Failure, FailureType, RequestSnapshot, ResponseSnapshot, Severity, Verdict, VerdictPolicy,
     VerdictStatus,

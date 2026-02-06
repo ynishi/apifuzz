@@ -227,58 +227,25 @@ fn run(cli: Cli) -> Result<i32> {
 
             let filtered = policy.filter(classified);
 
-            // Status code distribution analysis
-            let status_analysis = status::analyze(
-                &output.interactions,
-                cfg.success_criteria,
-                cfg.min_success_rate,
-            );
-
-            // If require_2xx produced failures, escalate verdict
-            let has_status_failures = status_analysis.warnings.iter().any(|w| w.is_failure);
+            // Status code distribution statistics (informational only)
+            let status_analysis = status::analyze(&output.interactions);
 
             let verdict = policy.verdict(&filtered);
-
-            // Escalate exit code if status analysis found failures
-            let final_exit_code = if has_status_failures && verdict.exit_code == 0 {
-                1 // Warning-level exit
-            } else {
-                verdict.exit_code
-            };
-
-            let final_verdict = if final_exit_code != verdict.exit_code {
-                apifuzz_core::Verdict {
-                    status: VerdictStatus::Fail,
-                    exit_code: final_exit_code,
-                    reason: format!(
-                        "{} + status analysis: {}",
-                        verdict.reason,
-                        status_analysis
-                            .warnings
-                            .iter()
-                            .map(|w| w.message.as_str())
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    ),
-                }
-            } else {
-                verdict
-            };
 
             // Output
             match cli.output {
                 OutputFormat::Terminal => {
-                    let icon = if final_verdict.status == VerdictStatus::Pass {
+                    let icon = if verdict.status == VerdictStatus::Pass {
                         "PASS"
                     } else {
                         "FAIL"
                     };
-                    println!("\n{icon}: {}", final_verdict.reason);
+                    println!("\n{icon}: {}", verdict.reason);
                     println!(
                         "  Requests: {} total, {} success, {} failures",
                         output.total, output.success, output.failure_count
                     );
-                    println!("  Exit code: {}", final_verdict.exit_code);
+                    println!("  Exit code: {}", verdict.exit_code);
 
                     // Status distribution per operation
                     if !status_analysis.operations.is_empty() {
@@ -299,15 +266,6 @@ fn run(cli: Cli) -> Result<i32> {
                             ),
                             status::format_pct(status_analysis.global.success_rate),
                         );
-                    }
-
-                    // Status warnings
-                    for w in &status_analysis.warnings {
-                        if w.is_failure {
-                            println!("  FAIL: {}", w.message);
-                        } else {
-                            println!("  WARNING: {}", w.message);
-                        }
                     }
 
                     if !filtered.is_empty() {
@@ -340,8 +298,8 @@ fn run(cli: Cli) -> Result<i32> {
                 OutputFormat::Json => {
                     let json_output = serde_json::json!({
                         "verdict": {
-                            "status": format!("{}", final_verdict.status),
-                            "exit_code": final_verdict.exit_code,
+                            "status": format!("{}", verdict.status),
+                            "exit_code": verdict.exit_code,
                         },
                         "stats": {
                             "total": output.total,
@@ -351,7 +309,6 @@ fn run(cli: Cli) -> Result<i32> {
                         "status_analysis": {
                             "global": status_analysis.global,
                             "operations": status_analysis.operations,
-                            "warnings": status_analysis.warnings,
                         },
                         "failures": filtered,
                     });
@@ -405,9 +362,9 @@ fn run(cli: Cli) -> Result<i32> {
                 config: &cfg,
                 output: &output,
                 failures: &filtered,
-                verdict_status: final_verdict.status,
-                verdict_exit_code: final_verdict.exit_code,
-                verdict_reason: &final_verdict.reason,
+                verdict_status: verdict.status,
+                verdict_exit_code: verdict.exit_code,
+                verdict_reason: &verdict.reason,
                 level: level_str,
                 duration_secs,
             };
@@ -420,7 +377,7 @@ fn run(cli: Cli) -> Result<i32> {
                 Err(e) => eprintln!("Warning: failed to save report: {e}"),
             }
 
-            Ok(final_verdict.exit_code)
+            Ok(verdict.exit_code)
         }
 
         Commands::Init => {

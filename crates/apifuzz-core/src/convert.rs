@@ -81,10 +81,12 @@ fn classify_type(type_name: &str, status_code: Option<u16>) -> FailureType {
     match type_name {
         "ServerError" => FailureType::ServerError,
         "ResponseTimeExceeded" => FailureType::Timeout,
-        "MalformedJson" | "SchemaViolation" => FailureType::SchemaViolation,
-        "StatusCodeConformance" => FailureType::StatusCodeConformance,
+        "MalformedJson" | "SchemaViolation" | "BodySatisfyExpectation" => {
+            FailureType::SchemaViolation
+        }
+        "StatusCodeConformance" | "StatusSatisfyExpectation" => FailureType::StatusCodeConformance,
         "NegativeTestAccepted" => FailureType::NegativeTestAccepted,
-        "ContentTypeMismatch" => FailureType::ContentTypeMismatch,
+        "ContentTypeMismatch" | "HeaderSatisfyExpectation" => FailureType::ContentTypeMismatch,
         // Unknown types: fall back to status-code classification
         _ => status_code.map_or(FailureType::UnexpectedError, |sc| match sc {
             408 | 504 => FailureType::Timeout,
@@ -315,6 +317,22 @@ mod tests {
     fn classify_malformed_json() {
         assert_eq!(
             classify_type("MalformedJson", Some(200)),
+            FailureType::SchemaViolation
+        );
+    }
+
+    #[test]
+    fn classify_new_expectation_types() {
+        assert_eq!(
+            classify_type("StatusSatisfyExpectation", Some(422)),
+            FailureType::StatusCodeConformance
+        );
+        assert_eq!(
+            classify_type("HeaderSatisfyExpectation", Some(200)),
+            FailureType::ContentTypeMismatch
+        );
+        assert_eq!(
+            classify_type("BodySatisfyExpectation", Some(200)),
             FailureType::SchemaViolation
         );
     }

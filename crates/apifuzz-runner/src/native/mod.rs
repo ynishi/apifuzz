@@ -22,8 +22,8 @@ use crate::datagen;
 use checks::CheckInput;
 use checks::run_checks;
 use phases::{
-    FuzzPhase, Overrides, collect_boundary_cases, collect_probe_cases,
-    collect_type_confusion_cases, generate_neighborhood_override,
+    FuzzPhase, Overrides, StatusExpectation, collect_boundary_cases, collect_probe_cases,
+    collect_type_confusion_cases, generate_neighborhood_case,
 };
 use spec::{Operation, ParamLocation, extract_operations};
 
@@ -379,7 +379,7 @@ impl NativeRunner {
             // Phase 0: Custom probes (user-defined known-bug patterns)
             let probe_cases = collect_probe_cases(op, &self.probes);
             let mut pr = PhaseStats::default();
-            for ov in &probe_cases {
+            for case in &probe_cases {
                 if self.limit.is_some_and(|l| op_count >= l) {
                     break;
                 }
@@ -388,8 +388,8 @@ impl NativeRunner {
                     op,
                     &components,
                     &mut rng,
-                    Some(ov),
-                    FuzzPhase::Probe,
+                    Some(&case.overrides),
+                    &case.expectation,
                     &mut acc.seen_spec_gaps,
                 );
                 if record_and_check_stop(
@@ -409,7 +409,7 @@ impl NativeRunner {
             // Phase 1: Fixed boundary (deterministic)
             let boundary_cases = collect_boundary_cases(op, &components);
             let mut p1 = PhaseStats::default();
-            for ov in &boundary_cases {
+            for case in &boundary_cases {
                 if self.limit.is_some_and(|l| op_count >= l) {
                     break;
                 }
@@ -418,8 +418,8 @@ impl NativeRunner {
                     op,
                     &components,
                     &mut rng,
-                    Some(ov),
-                    FuzzPhase::Boundary,
+                    Some(&case.overrides),
+                    &case.expectation,
                     &mut acc.seen_spec_gaps,
                 );
                 if record_and_check_stop(
@@ -439,7 +439,7 @@ impl NativeRunner {
             // Phase 1b: Type confusion (deterministic)
             let tc_cases = collect_type_confusion_cases(op, &components);
             let mut tc = PhaseStats::default();
-            for ov in &tc_cases {
+            for case in &tc_cases {
                 if self.limit.is_some_and(|l| op_count >= l) {
                     break;
                 }
@@ -448,8 +448,8 @@ impl NativeRunner {
                     op,
                     &components,
                     &mut rng,
-                    Some(ov),
-                    FuzzPhase::TypeConfusion,
+                    Some(&case.overrides),
+                    &case.expectation,
                     &mut acc.seen_spec_gaps,
                 );
                 if record_and_check_stop(
@@ -472,11 +472,12 @@ impl NativeRunner {
                 if self.limit.is_some_and(|l| op_count >= l) {
                     break;
                 }
-                let overrides = generate_neighborhood_override(op, &components, &mut rng);
-                let ov = if overrides.params.is_empty() && overrides.body_props.is_empty() {
+                let case = generate_neighborhood_case(op, &components, &mut rng);
+                let ov = if case.overrides.params.is_empty() && case.overrides.body_props.is_empty()
+                {
                     None
                 } else {
-                    Some(&overrides)
+                    Some(&case.overrides)
                 };
                 let r = self.execute_one(
                     &client,
@@ -484,7 +485,7 @@ impl NativeRunner {
                     &components,
                     &mut rng,
                     ov,
-                    FuzzPhase::Neighborhood,
+                    &case.expectation,
                     &mut acc.seen_spec_gaps,
                 );
                 if record_and_check_stop(
@@ -501,7 +502,8 @@ impl NativeRunner {
                 }
             }
 
-            // Phase 3: Full random
+            // Phase 3: Full random (spec-compliant input → expect 2xx)
+            let random_expectation = StatusExpectation::from_phase(op, FuzzPhase::Random);
             let mut p3 = PhaseStats::default();
             for _ in 0..random_count {
                 if self.limit.is_some_and(|l| op_count >= l) {
@@ -513,7 +515,7 @@ impl NativeRunner {
                     &components,
                     &mut rng,
                     None,
-                    FuzzPhase::Random,
+                    &random_expectation,
                     &mut acc.seen_spec_gaps,
                 );
                 if record_and_check_stop(
@@ -569,7 +571,7 @@ impl NativeRunner {
         components: &serde_json::Value,
         rng: &mut impl Rng,
         overrides: Option<&Overrides>,
-        phase: FuzzPhase,
+        expectation: &StatusExpectation,
         seen_spec_gaps: &mut HashSet<String>,
     ) -> Result<(RawInteraction, Vec<RawFailure>), String> {
         // Build URL with path parameters
@@ -666,12 +668,13 @@ impl NativeRunner {
         let status_code = resp.status().as_u16();
         let status_text = resp.status().canonical_reason().unwrap_or("").to_string();
 
-        // Read Content-Type before consuming response body
+        // Capture response headers before consuming response body
         let resp_content_type = resp
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
+        let resp_headers = resp.headers().clone();
 
         // Capture response body (truncated for memory safety)
         let body_text = resp.text().unwrap_or_default();
@@ -733,16 +736,17 @@ impl NativeRunner {
             body: body_stored,
         };
 
-        // Run all 6 response checks (pure logic, no I/O)
+        // Run response validation checks (pure logic, no I/O)
         let mut check_input = CheckInput {
             status_code,
             body_text: &body_text,
             content_type: resp_content_type.as_deref(),
+            response_headers: &resp_headers,
             elapsed,
             url: &url,
             operation_label: &operation_label,
             case_id: &case_id,
-            phase,
+            expectation,
             op,
             response_time_limit: self.response_time_limit,
             seen_spec_gaps,
@@ -812,7 +816,7 @@ mod tests {
 
     use checks::CheckInput;
     use checks::run_checks;
-    use phases::FuzzPhase;
+    use phases::StatusExpectation;
     use spec::Operation;
 
     // ── Test helpers ──
@@ -826,6 +830,7 @@ mod tests {
             expected_statuses: vec![200, 422],
             response_schemas: HashMap::new(),
             response_content_types: HashMap::new(),
+            response_headers: HashMap::new(),
         }
     }
 
@@ -833,21 +838,30 @@ mod tests {
         run_checks(input)
     }
 
+    /// Default expectation: AnyDeclared [200, 422] — won't fire StatusSatisfyExpectation
+    /// for statuses 200 or 422, allowing other checks to be tested in isolation.
+    fn default_expectation() -> StatusExpectation {
+        StatusExpectation::AnyDeclared(vec![200, 422])
+    }
+
     fn input_with<'a>(
         op: &'a Operation,
         status: u16,
         body: &'a str,
+        expectation: &'a StatusExpectation,
+        resp_headers: &'a reqwest::header::HeaderMap,
         seen: &'a mut HashSet<String>,
     ) -> CheckInput<'a> {
         CheckInput {
             status_code: status,
             body_text: body,
             content_type: Some("application/json"),
+            response_headers: resp_headers,
             elapsed: 0.05,
             url: "http://localhost:8080/test",
             operation_label: "GET /test",
             case_id: "test-001",
-            phase: FuzzPhase::Random,
+            expectation,
             op,
             response_time_limit: None,
             seen_spec_gaps: seen,
@@ -924,186 +938,210 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════
-    // Check 1: ServerError (5xx)
+    // Health Check: ServerError (5xx)
     // ═══════════════════════════════════════════
 
     #[test]
-    fn check1_500_detected() {
+    fn server_error_500_detected() {
         let op = base_op();
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 500, "Internal Server Error", &mut seen);
+        let mut input = input_with(&op, 500, "Internal Server Error", &exp, &hdrs, &mut seen);
         let f = check(&mut input);
         assert!(has_type(&f, "ServerError"), "500 must be detected");
     }
 
     #[test]
-    fn check1_502_detected() {
+    fn server_error_502_detected() {
         let op = base_op();
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 502, "Bad Gateway", &mut seen);
+        let mut input = input_with(&op, 502, "Bad Gateway", &exp, &hdrs, &mut seen);
         let f = check(&mut input);
         assert!(has_type(&f, "ServerError"), "502 must be detected");
     }
 
     #[test]
-    fn check1_200_not_flagged() {
-        let op = base_op();
-        let mut seen = HashSet::new();
-        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &mut seen);
-        // Give it a schema so check5 doesn't fire spec-gap warning
-        let mut op2 = base_op();
-        op2.response_schemas
+    fn server_error_200_not_flagged() {
+        let mut op = base_op();
+        op.response_schemas
             .insert(200, serde_json::json!({"type": "object"}));
-        op2.response_content_types
+        op.response_content_types
             .insert(200, vec!["application/json".to_string()]);
-        input.op = &op2;
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new();
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &exp, &hdrs, &mut seen);
         let f = check(&mut input);
         assert!(!has_type(&f, "ServerError"), "200 must not be ServerError");
     }
 
     #[test]
-    fn check1_400_not_flagged() {
+    fn server_error_400_not_flagged() {
         let op = base_op();
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 400, "Bad Request", &mut seen);
+        let mut input = input_with(&op, 400, "Bad Request", &exp, &hdrs, &mut seen);
         let f = check(&mut input);
         assert!(!has_type(&f, "ServerError"), "400 must not be ServerError");
     }
 
     // ═══════════════════════════════════════════
-    // Check 2: StatusCodeConformance
+    // StatusSatisfyExpectation (replaces Check 2 + 3)
     // ═══════════════════════════════════════════
 
     #[test]
-    fn check2_undeclared_status_detected() {
-        let op = base_op(); // expected: [200, 422]
+    fn status_any_declared_undeclared_detected() {
+        let op = base_op(); // declared: [200, 422]
+        let exp = StatusExpectation::AnyDeclared(vec![200, 422]);
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 404, "Not Found", &mut seen);
+        let mut input = input_with(&op, 404, "Not Found", &exp, &hdrs, &mut seen);
         let f = check(&mut input);
         assert!(
-            has_type(&f, "StatusCodeConformance"),
+            has_type(&f, "StatusSatisfyExpectation"),
             "404 not in [200, 422] must be detected"
         );
-        let fail = find_type(&f, "StatusCodeConformance").unwrap();
-        assert!(fail.message.contains("404 not in spec"));
+        let fail = find_type(&f, "StatusSatisfyExpectation").unwrap();
+        assert!(fail.message.contains("404"));
     }
 
     #[test]
-    fn check2_declared_status_ok() {
+    fn status_any_declared_ok() {
         let mut op = base_op();
         op.response_schemas
             .insert(200, serde_json::json!({"type": "object"}));
         op.response_content_types
             .insert(200, vec!["application/json".to_string()]);
+        let exp = StatusExpectation::AnyDeclared(vec![200, 422]);
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &mut seen);
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &exp, &hdrs, &mut seen);
         let f = check(&mut input);
         assert!(
-            !has_type(&f, "StatusCodeConformance"),
+            !has_type(&f, "StatusSatisfyExpectation"),
             "200 is declared, should not fire"
         );
     }
 
     #[test]
-    fn check2_5xx_excluded() {
+    fn status_5xx_excluded_from_expectation() {
         let op = base_op();
+        let exp = StatusExpectation::AnyDeclared(vec![200, 422]);
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 500, "error", &mut seen);
+        let mut input = input_with(&op, 500, "error", &exp, &hdrs, &mut seen);
         let f = check(&mut input);
         assert!(
-            !has_type(&f, "StatusCodeConformance"),
-            "5xx excluded from conformance check"
+            !has_type(&f, "StatusSatisfyExpectation"),
+            "5xx handled by ServerError, not status expectation"
         );
         assert!(has_type(&f, "ServerError"));
     }
 
     #[test]
-    fn check2_empty_expected_skips() {
-        let mut op = base_op();
-        op.expected_statuses = vec![];
-        let mut seen = HashSet::new();
-        let mut input = input_with(&op, 404, "Not Found", &mut seen);
-        let f = check(&mut input);
-        assert!(
-            !has_type(&f, "StatusCodeConformance"),
-            "No expected statuses → skip (no basis for comparison)"
-        );
-    }
-
-    // ═══════════════════════════════════════════
-    // Check 3: NegativeTestAccepted
-    // ═══════════════════════════════════════════
-
-    #[test]
-    fn check3_type_confusion_2xx_detected() {
+    fn status_rejection_2xx_detected() {
         let mut op = base_op();
         op.response_schemas
             .insert(200, serde_json::json!({"type": "object"}));
         op.response_content_types
             .insert(200, vec!["application/json".to_string()]);
+        let exp = StatusExpectation::Rejection;
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &mut seen);
-        input.phase = FuzzPhase::TypeConfusion;
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &exp, &hdrs, &mut seen);
         let f = check(&mut input);
         assert!(
-            has_type(&f, "NegativeTestAccepted"),
-            "TypeConfusion + 2xx must be detected"
+            has_type(&f, "StatusSatisfyExpectation"),
+            "Rejection expectation + 2xx must be detected"
         );
+        let fail = find_type(&f, "StatusSatisfyExpectation").unwrap();
+        assert_eq!(fail.title, "Invalid input accepted");
     }
 
     #[test]
-    fn check3_type_confusion_422_not_flagged() {
+    fn status_rejection_422_not_flagged() {
         let op = base_op();
+        let exp = StatusExpectation::Rejection;
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 422, r#"{"detail":"err"}"#, &mut seen);
-        input.phase = FuzzPhase::TypeConfusion;
+        let mut input = input_with(&op, 422, r#"{"detail":"err"}"#, &exp, &hdrs, &mut seen);
         let f = check(&mut input);
         assert!(
-            !has_type(&f, "NegativeTestAccepted"),
-            "TypeConfusion + 422 = server rejected, correct behavior"
+            !has_type(&f, "StatusSatisfyExpectation"),
+            "Rejection + 422 = correctly rejected"
         );
     }
 
     #[test]
-    fn check3_random_phase_2xx_not_flagged() {
+    fn status_success_expected_wrong_2xx() {
         let mut op = base_op();
         op.response_schemas
             .insert(200, serde_json::json!({"type": "object"}));
         op.response_content_types
             .insert(200, vec!["application/json".to_string()]);
+        let exp = StatusExpectation::SuccessExpected(vec![200]);
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &mut seen);
-        input.phase = FuzzPhase::Random;
+        let mut input = input_with(&op, 201, r#"{"ok":true}"#, &exp, &hdrs, &mut seen);
         let f = check(&mut input);
         assert!(
-            !has_type(&f, "NegativeTestAccepted"),
-            "Random phase must not trigger negative test check"
+            has_type(&f, "StatusSatisfyExpectation"),
+            "Got 201 when only 200 expected"
         );
+        let fail = find_type(&f, "StatusSatisfyExpectation").unwrap();
+        assert_eq!(fail.severity, "medium");
     }
 
     #[test]
-    fn check3_boundary_phase_2xx_not_flagged() {
-        let mut op = base_op();
-        op.response_schemas
-            .insert(200, serde_json::json!({"type": "object"}));
-        op.response_content_types
-            .insert(200, vec!["application/json".to_string()]);
-        let mut seen = HashSet::new();
-        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &mut seen);
-        input.phase = FuzzPhase::Boundary;
-        let f = check(&mut input);
-        assert!(!has_type(&f, "NegativeTestAccepted"));
-    }
-
-    // ═══════════════════════════════════════════
-    // Check 4: ResponseTimeExceeded
-    // ═══════════════════════════════════════════
-
-    #[test]
-    fn check4_exceeded_detected() {
+    fn status_success_expected_non_2xx() {
         let op = base_op();
+        let exp = StatusExpectation::SuccessExpected(vec![200]);
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 200, "{}", &mut seen);
+        let mut input = input_with(&op, 422, r#"{"detail":"err"}"#, &exp, &hdrs, &mut seen);
+        let f = check(&mut input);
+        assert!(
+            has_type(&f, "StatusSatisfyExpectation"),
+            "Valid input rejected → high severity"
+        );
+        let fail = find_type(&f, "StatusSatisfyExpectation").unwrap();
+        assert_eq!(fail.severity, "high");
+        assert_eq!(fail.title, "Valid input rejected");
+    }
+
+    #[test]
+    fn status_success_expected_ok() {
+        let mut op = base_op();
+        op.response_schemas
+            .insert(200, serde_json::json!({"type": "object"}));
+        op.response_content_types
+            .insert(200, vec!["application/json".to_string()]);
+        let exp = StatusExpectation::SuccessExpected(vec![200]);
+        let hdrs = reqwest::header::HeaderMap::new();
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &exp, &hdrs, &mut seen);
+        let f = check(&mut input);
+        assert!(
+            !has_type(&f, "StatusSatisfyExpectation"),
+            "200 is expected → no failure"
+        );
+    }
+
+    // ═══════════════════════════════════════════
+    // Health Check: ResponseTimeExceeded
+    // ═══════════════════════════════════════════
+
+    #[test]
+    fn response_time_exceeded_detected() {
+        let op = base_op();
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new();
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, "{}", &exp, &hdrs, &mut seen);
         input.response_time_limit = Some(1.0);
         input.elapsed = 2.5;
         let f = check(&mut input);
@@ -1114,10 +1152,12 @@ mod tests {
     }
 
     #[test]
-    fn check4_under_limit_ok() {
+    fn response_time_under_limit_ok() {
         let op = base_op();
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 200, "{}", &mut seen);
+        let mut input = input_with(&op, 200, "{}", &exp, &hdrs, &mut seen);
         input.response_time_limit = Some(5.0);
         input.elapsed = 0.05;
         let f = check(&mut input);
@@ -1128,10 +1168,12 @@ mod tests {
     }
 
     #[test]
-    fn check4_no_limit_configured() {
+    fn response_time_no_limit_configured() {
         let op = base_op();
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 200, "{}", &mut seen);
+        let mut input = input_with(&op, 200, "{}", &exp, &hdrs, &mut seen);
         input.response_time_limit = None;
         input.elapsed = 999.0;
         let f = check(&mut input);
@@ -1142,11 +1184,11 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════
-    // Check 5: SchemaViolation
+    // BodySatisfyExpectation (replaces SchemaViolation)
     // ═══════════════════════════════════════════
 
     #[test]
-    fn check5_body_violates_schema() {
+    fn body_violates_schema() {
         let mut op = base_op();
         op.response_schemas.insert(
             200,
@@ -1158,19 +1200,28 @@ mod tests {
         );
         op.response_content_types
             .insert(200, vec!["application/json".to_string()]);
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 200, r#"{"id": "not-a-number"}"#, &mut seen);
+        let mut input = input_with(
+            &op,
+            200,
+            r#"{"id": "not-a-number"}"#,
+            &exp,
+            &hdrs,
+            &mut seen,
+        );
         let f = check(&mut input);
         assert!(
-            has_type(&f, "SchemaViolation"),
+            has_type(&f, "BodySatisfyExpectation"),
             "Body violating schema must be detected"
         );
-        let fail = find_type(&f, "SchemaViolation").unwrap();
+        let fail = find_type(&f, "BodySatisfyExpectation").unwrap();
         assert_eq!(fail.title, "Response body does not match schema");
     }
 
     #[test]
-    fn check5_body_matches_schema() {
+    fn body_matches_schema() {
         let mut op = base_op();
         op.response_schemas.insert(
             200,
@@ -1182,190 +1233,379 @@ mod tests {
         );
         op.response_content_types
             .insert(200, vec!["application/json".to_string()]);
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 200, r#"{"id": 42}"#, &mut seen);
+        let mut input = input_with(&op, 200, r#"{"id": 42}"#, &exp, &hdrs, &mut seen);
         let f = check(&mut input);
         assert!(
-            !has_type(&f, "SchemaViolation"),
-            "Valid body must not fire SchemaViolation"
+            !has_type(&f, "BodySatisfyExpectation"),
+            "Valid body must not fire"
         );
     }
 
     #[test]
-    fn check5_non_json_body_with_schema() {
+    fn body_non_json_with_json_content_type() {
         let mut op = base_op();
         op.response_schemas
             .insert(200, serde_json::json!({"type": "object"}));
         op.response_content_types
             .insert(200, vec!["application/json".to_string()]);
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 200, "this is not json", &mut seen);
+        let mut input = input_with(&op, 200, "this is not json", &exp, &hdrs, &mut seen);
         let f = check(&mut input);
-        assert!(has_type(&f, "SchemaViolation"));
-        let fail = find_type(&f, "SchemaViolation").unwrap();
+        assert!(has_type(&f, "BodySatisfyExpectation"));
+        let fail = find_type(&f, "BodySatisfyExpectation").unwrap();
         assert_eq!(fail.title, "Response body is not valid JSON");
     }
 
     #[test]
-    fn check5_empty_schema_warns_on_2xx() {
+    fn body_empty_schema_warns_on_2xx() {
         let mut op = base_op();
         op.response_schemas.insert(200, serde_json::json!({}));
         op.response_content_types
             .insert(200, vec!["application/json".to_string()]);
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 200, r#"{"anything": "goes"}"#, &mut seen);
+        let mut input = input_with(&op, 200, r#"{"anything": "goes"}"#, &exp, &hdrs, &mut seen);
         let f = check(&mut input);
         assert!(
-            has_type(&f, "SchemaViolation"),
+            has_type(&f, "BodySatisfyExpectation"),
             "Empty schema on 2xx must warn (spec gap)"
         );
-        let fail = find_type(&f, "SchemaViolation").unwrap();
+        let fail = find_type(&f, "BodySatisfyExpectation").unwrap();
         assert_eq!(fail.title, "Response schema is empty");
-        assert_eq!(fail.severity, "medium");
+        assert_eq!(fail.severity, "low");
     }
 
     #[test]
-    fn check5_no_schema_defined_warns_on_2xx() {
+    fn body_no_schema_defined_warns_on_2xx() {
         let mut op = base_op();
         op.response_content_types
             .insert(200, vec!["application/json".to_string()]);
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 200, r#"{"data": 1}"#, &mut seen);
+        let mut input = input_with(&op, 200, r#"{"data": 1}"#, &exp, &hdrs, &mut seen);
         let f = check(&mut input);
         assert!(
-            has_type(&f, "SchemaViolation"),
+            has_type(&f, "BodySatisfyExpectation"),
             "No schema for 2xx with body must warn (spec gap)"
         );
-        let fail = find_type(&f, "SchemaViolation").unwrap();
+        let fail = find_type(&f, "BodySatisfyExpectation").unwrap();
         assert_eq!(fail.title, "No response schema defined");
     }
 
     #[test]
-    fn check5_no_schema_on_4xx_silent() {
+    fn body_no_schema_on_4xx_silent() {
         let op = base_op();
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 422, r#"{"detail":"err"}"#, &mut seen);
+        let mut input = input_with(&op, 422, r#"{"detail":"err"}"#, &exp, &hdrs, &mut seen);
         let f = check(&mut input);
         assert!(
-            !f.iter().any(|ff| ff.failure_type == "SchemaViolation"),
+            !f.iter()
+                .any(|ff| ff.failure_type == "BodySatisfyExpectation"),
             "Non-2xx missing schema should not warn"
         );
     }
 
     #[test]
-    fn check5_no_schema_on_2xx_empty_body_silent() {
+    fn body_no_schema_on_2xx_empty_body_silent() {
         let op = base_op();
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 200, "", &mut seen);
+        let mut input = input_with(&op, 200, "", &exp, &hdrs, &mut seen);
         let f = check(&mut input);
         assert!(
-            !f.iter().any(|ff| ff.failure_type == "SchemaViolation"
-                && ff.title == "No response schema defined"),
+            !f.iter()
+                .any(|ff| ff.failure_type == "BodySatisfyExpectation"
+                    && ff.title == "No response schema defined"),
             "No schema + empty body → no warning needed"
         );
     }
 
     // ═══════════════════════════════════════════
-    // Check 6: ContentTypeMismatch
+    // HeaderSatisfyExpectation (replaces ContentTypeMismatch)
     // ═══════════════════════════════════════════
 
     #[test]
-    fn check6_mismatch_detected() {
+    fn header_content_type_mismatch_detected() {
         let mut op = base_op();
         op.response_content_types
             .insert(200, vec!["application/json".to_string()]);
         op.response_schemas
             .insert(200, serde_json::json!({"type": "object"}));
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 200, r#"<html>oops</html>"#, &mut seen);
+        let mut input = input_with(&op, 200, r#"<html>oops</html>"#, &exp, &hdrs, &mut seen);
         input.content_type = Some("text/html");
         let f = check(&mut input);
         assert!(
-            has_type(&f, "ContentTypeMismatch"),
+            has_type(&f, "HeaderSatisfyExpectation"),
             "text/html when spec says application/json must be detected"
         );
-        let fail = find_type(&f, "ContentTypeMismatch").unwrap();
+        let fail = find_type(&f, "HeaderSatisfyExpectation").unwrap();
         assert_eq!(fail.title, "Unexpected Content-Type");
     }
 
     #[test]
-    fn check6_match_ok() {
+    fn header_content_type_match_ok() {
         let mut op = base_op();
         op.response_content_types
             .insert(200, vec!["application/json".to_string()]);
         op.response_schemas
             .insert(200, serde_json::json!({"type": "object"}));
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &mut seen);
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &exp, &hdrs, &mut seen);
         let f = check(&mut input);
         assert!(
-            !has_type(&f, "ContentTypeMismatch"),
+            !has_type(&f, "HeaderSatisfyExpectation"),
             "Matching Content-Type must not fire"
         );
     }
 
     #[test]
-    fn check6_charset_ignored() {
+    fn header_content_type_charset_ignored() {
         let mut op = base_op();
         op.response_content_types
             .insert(200, vec!["application/json".to_string()]);
         op.response_schemas
             .insert(200, serde_json::json!({"type": "object"}));
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &mut seen);
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &exp, &hdrs, &mut seen);
         input.content_type = Some("application/json; charset=utf-8");
         let f = check(&mut input);
         assert!(
-            !has_type(&f, "ContentTypeMismatch"),
+            !has_type(&f, "HeaderSatisfyExpectation"),
             "charset param must be ignored in comparison"
         );
     }
 
     #[test]
-    fn check6_missing_header_detected() {
+    fn header_missing_content_type_detected() {
         let mut op = base_op();
         op.response_content_types
             .insert(200, vec!["application/json".to_string()]);
         op.response_schemas
             .insert(200, serde_json::json!({"type": "object"}));
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &mut seen);
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &exp, &hdrs, &mut seen);
         input.content_type = None;
         let f = check(&mut input);
         assert!(
-            has_type(&f, "ContentTypeMismatch"),
+            has_type(&f, "HeaderSatisfyExpectation"),
             "Missing Content-Type header when spec declares types must be detected"
         );
-        let fail = find_type(&f, "ContentTypeMismatch").unwrap();
+        let fail = find_type(&f, "HeaderSatisfyExpectation").unwrap();
         assert_eq!(fail.title, "Missing Content-Type header");
     }
 
     #[test]
-    fn check6_no_types_declared_warns_on_2xx() {
+    fn header_no_types_declared_warns_on_2xx() {
         let mut op = base_op();
         op.response_schemas
             .insert(200, serde_json::json!({"type": "object"}));
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &mut seen);
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &exp, &hdrs, &mut seen);
         let f = check(&mut input);
         assert!(
-            has_type(&f, "ContentTypeMismatch"),
+            has_type(&f, "HeaderSatisfyExpectation"),
             "No content types declared for 2xx must warn (spec gap)"
         );
-        let fail = find_type(&f, "ContentTypeMismatch").unwrap();
+        let fail = find_type(&f, "HeaderSatisfyExpectation").unwrap();
         assert_eq!(fail.title, "No content types declared in spec");
     }
 
     #[test]
-    fn check6_no_types_on_4xx_silent() {
+    fn header_no_types_on_4xx_silent() {
         let op = base_op();
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 422, r#"{"detail":"err"}"#, &mut seen);
+        let mut input = input_with(&op, 422, r#"{"detail":"err"}"#, &exp, &hdrs, &mut seen);
         let f = check(&mut input);
         assert!(
-            !f.iter().any(|ff| ff.failure_type == "ContentTypeMismatch"
-                && ff.title == "No content types declared in spec"),
+            !f.iter()
+                .any(|ff| ff.failure_type == "HeaderSatisfyExpectation"
+                    && ff.title == "No content types declared in spec"),
             "Non-2xx missing content types should not warn"
+        );
+    }
+
+    // ═══════════════════════════════════════════
+    // HeaderSatisfyExpectation: response headers
+    // ═══════════════════════════════════════════
+
+    #[test]
+    fn header_required_missing_detected() {
+        let mut op = base_op();
+        op.response_content_types
+            .insert(200, vec!["application/json".to_string()]);
+        op.response_schemas
+            .insert(200, serde_json::json!({"type": "object"}));
+        op.response_headers.insert(
+            200,
+            vec![spec::ResponseHeader {
+                name: "X-Request-Id".to_string(),
+                required: true,
+                schema: None,
+            }],
+        );
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new(); // missing X-Request-Id
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &exp, &hdrs, &mut seen);
+        let f = check(&mut input);
+        let hdr_fails: Vec<_> = f
+            .iter()
+            .filter(|ff| {
+                ff.failure_type == "HeaderSatisfyExpectation"
+                    && ff.title == "Required response header missing"
+            })
+            .collect();
+        assert_eq!(
+            hdr_fails.len(),
+            1,
+            "Required header missing must be detected"
+        );
+        assert!(hdr_fails[0].message.contains("X-Request-Id"));
+    }
+
+    #[test]
+    fn header_required_present_ok() {
+        let mut op = base_op();
+        op.response_content_types
+            .insert(200, vec!["application/json".to_string()]);
+        op.response_schemas
+            .insert(200, serde_json::json!({"type": "object"}));
+        op.response_headers.insert(
+            200,
+            vec![spec::ResponseHeader {
+                name: "X-Request-Id".to_string(),
+                required: true,
+                schema: None,
+            }],
+        );
+        let exp = default_expectation();
+        let mut hdrs = reqwest::header::HeaderMap::new();
+        hdrs.insert("X-Request-Id", "abc-123".parse().unwrap());
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &exp, &hdrs, &mut seen);
+        let f = check(&mut input);
+        assert!(
+            !f.iter()
+                .any(|ff| ff.failure_type == "HeaderSatisfyExpectation"
+                    && ff.title == "Required response header missing"),
+            "Present required header must not fire"
+        );
+    }
+
+    #[test]
+    fn header_schema_violation_detected() {
+        let mut op = base_op();
+        op.response_content_types
+            .insert(200, vec!["application/json".to_string()]);
+        op.response_schemas
+            .insert(200, serde_json::json!({"type": "object"}));
+        op.response_headers.insert(
+            200,
+            vec![spec::ResponseHeader {
+                name: "X-Rate-Limit".to_string(),
+                required: false,
+                schema: Some(serde_json::json!({"type": "integer", "minimum": 0})),
+            }],
+        );
+        let exp = default_expectation();
+        let mut hdrs = reqwest::header::HeaderMap::new();
+        hdrs.insert("X-Rate-Limit", "not-a-number".parse().unwrap());
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &exp, &hdrs, &mut seen);
+        let f = check(&mut input);
+        let hdr_fails: Vec<_> = f
+            .iter()
+            .filter(|ff| {
+                ff.failure_type == "HeaderSatisfyExpectation"
+                    && ff.title == "Response header type mismatch"
+            })
+            .collect();
+        assert_eq!(
+            hdr_fails.len(),
+            1,
+            "Non-integer value for integer schema must be detected"
+        );
+        assert!(hdr_fails[0].message.contains("X-Rate-Limit"));
+    }
+
+    #[test]
+    fn header_schema_valid_integer_ok() {
+        let mut op = base_op();
+        op.response_content_types
+            .insert(200, vec!["application/json".to_string()]);
+        op.response_schemas
+            .insert(200, serde_json::json!({"type": "object"}));
+        op.response_headers.insert(
+            200,
+            vec![spec::ResponseHeader {
+                name: "X-Rate-Limit".to_string(),
+                required: false,
+                schema: Some(serde_json::json!({"type": "integer", "minimum": 0})),
+            }],
+        );
+        let exp = default_expectation();
+        let mut hdrs = reqwest::header::HeaderMap::new();
+        hdrs.insert("X-Rate-Limit", "100".parse().unwrap());
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &exp, &hdrs, &mut seen);
+        let f = check(&mut input);
+        assert!(
+            !f.iter()
+                .any(|ff| ff.failure_type == "HeaderSatisfyExpectation"
+                    && (ff.title == "Response header type mismatch"
+                        || ff.title == "Response header schema violation")),
+            "Valid integer header must not fire"
+        );
+    }
+
+    #[test]
+    fn header_optional_missing_silent() {
+        let mut op = base_op();
+        op.response_content_types
+            .insert(200, vec!["application/json".to_string()]);
+        op.response_schemas
+            .insert(200, serde_json::json!({"type": "object"}));
+        op.response_headers.insert(
+            200,
+            vec![spec::ResponseHeader {
+                name: "X-Optional".to_string(),
+                required: false,
+                schema: Some(serde_json::json!({"type": "string"})),
+            }],
+        );
+        let exp = default_expectation();
+        let hdrs = reqwest::header::HeaderMap::new(); // missing optional header
+        let mut seen = HashSet::new();
+        let mut input = input_with(&op, 200, r#"{"ok":true}"#, &exp, &hdrs, &mut seen);
+        let f = check(&mut input);
+        assert!(
+            !f.iter()
+                .any(|ff| ff.failure_type == "HeaderSatisfyExpectation"
+                    && ff.title == "Required response header missing"),
+            "Optional header missing must not fire"
         );
     }
 
@@ -1386,16 +1626,23 @@ mod tests {
         );
         op.response_content_types
             .insert(200, vec!["application/xml".to_string()]);
+        let exp = StatusExpectation::Rejection;
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 200, r#"{"id": "wrong"}"#, &mut seen);
-        input.phase = FuzzPhase::TypeConfusion;
+        let mut input = input_with(&op, 200, r#"{"id": "wrong"}"#, &exp, &hdrs, &mut seen);
         input.response_time_limit = Some(0.01);
         input.elapsed = 1.0;
         let f = check(&mut input);
-        assert!(has_type(&f, "NegativeTestAccepted"), "Check 3");
-        assert!(has_type(&f, "ResponseTimeExceeded"), "Check 4");
-        assert!(has_type(&f, "SchemaViolation"), "Check 5");
-        assert!(has_type(&f, "ContentTypeMismatch"), "Check 6");
+        assert!(
+            has_type(&f, "StatusSatisfyExpectation"),
+            "Invalid input accepted"
+        );
+        assert!(has_type(&f, "ResponseTimeExceeded"), "Over limit");
+        assert!(has_type(&f, "BodySatisfyExpectation"), "Schema mismatch");
+        assert!(
+            has_type(&f, "HeaderSatisfyExpectation"),
+            "Content-Type mismatch"
+        );
     }
 
     // ═══════════════════════════════════════════
@@ -1466,8 +1713,10 @@ mod tests {
         );
         op.response_content_types
             .insert(200, vec!["application/json".to_string()]);
+        let exp = StatusExpectation::SuccessExpected(vec![200]);
+        let hdrs = reqwest::header::HeaderMap::new();
         let mut seen = HashSet::new();
-        let mut input = input_with(&op, 200, r#"{"status": "ok"}"#, &mut seen);
+        let mut input = input_with(&op, 200, r#"{"status": "ok"}"#, &exp, &hdrs, &mut seen);
         let f = check(&mut input);
         assert!(
             f.is_empty(),

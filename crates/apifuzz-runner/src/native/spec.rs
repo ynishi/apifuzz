@@ -15,6 +15,15 @@ pub(super) struct Operation {
     pub(super) response_schemas: HashMap<u16, serde_json::Value>,
     /// Expected content types per status code
     pub(super) response_content_types: HashMap<u16, Vec<String>>,
+    /// Expected response headers per status code
+    pub(super) response_headers: HashMap<u16, Vec<ResponseHeader>>,
+}
+
+/// A declared response header from the OpenAPI spec.
+pub(super) struct ResponseHeader {
+    pub(super) name: String,
+    pub(super) required: bool,
+    pub(super) schema: Option<serde_json::Value>,
 }
 
 pub(super) struct Parameter {
@@ -79,14 +88,16 @@ pub(super) fn extract_operations(spec: &serde_json::Value) -> Vec<Operation> {
 
                 let mut response_schemas: HashMap<u16, serde_json::Value> = HashMap::new();
                 let mut response_content_types: HashMap<u16, Vec<String>> = HashMap::new();
+                let mut response_headers: HashMap<u16, Vec<ResponseHeader>> = HashMap::new();
 
                 if let Some(responses) = responses_obj {
                     for (status_str, resp_obj) in responses {
                         let Some(status) = status_str.parse::<u16>().ok() else {
                             continue;
                         };
+
+                        // Content types and schemas
                         if let Some(content) = resp_obj.get("content").and_then(|c| c.as_object()) {
-                            // Content types declared for this status
                             let types: Vec<String> = content.keys().cloned().collect();
                             if !types.is_empty() {
                                 response_content_types.insert(status, types);
@@ -100,6 +111,29 @@ pub(super) fn extract_operations(spec: &serde_json::Value) -> Vec<Operation> {
                                 response_schemas.insert(status, resolved);
                             }
                         }
+
+                        // Response headers
+                        if let Some(headers) = resp_obj.get("headers").and_then(|h| h.as_object()) {
+                            let hdrs: Vec<ResponseHeader> = headers
+                                .iter()
+                                .map(|(name, hdr_obj)| {
+                                    let required = hdr_obj
+                                        .get("required")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                    let schema =
+                                        hdr_obj.get("schema").map(|s| resolve_refs(s, &components));
+                                    ResponseHeader {
+                                        name: name.clone(),
+                                        required,
+                                        schema,
+                                    }
+                                })
+                                .collect();
+                            if !hdrs.is_empty() {
+                                response_headers.insert(status, hdrs);
+                            }
+                        }
                     }
                 }
 
@@ -111,6 +145,7 @@ pub(super) fn extract_operations(spec: &serde_json::Value) -> Vec<Operation> {
                     expected_statuses,
                     response_schemas,
                     response_content_types,
+                    response_headers,
                 });
             }
         }
