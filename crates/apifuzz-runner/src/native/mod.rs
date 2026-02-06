@@ -156,6 +156,131 @@ impl NativeRunner {
         self
     }
 
+    /// Generate a dry run plan: parse spec, count phases, validate config.
+    /// No HTTP requests are sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if spec cannot be read or parsed.
+    pub fn plan(
+        &self,
+        config: &apifuzz_core::Config,
+    ) -> Result<apifuzz_core::dryrun::DryRunPlan, NativeError> {
+        use apifuzz_core::dryrun::{
+            DryRunPlan, MatchedProbe, OperationPlan, PhaseCounts, Validation, ValidationStatus,
+        };
+
+        let spec_content = std::fs::read_to_string(&self.spec_path)
+            .map_err(|e| NativeError::Io(format!("{}: {e}", self.spec_path.display())))?;
+        let spec: serde_json::Value = parse_spec(&self.spec_path, &spec_content)?;
+
+        let components = spec
+            .get("components")
+            .and_then(|c| c.get("schemas"))
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+
+        let operations = extract_operations(&spec);
+
+        let max_examples = self.level.max_examples();
+        let neighborhood_count = max_examples / 3;
+        let random_count = max_examples - neighborhood_count;
+
+        let mut op_plans = Vec::new();
+        let mut total_requests: u64 = 0;
+
+        for op in &operations {
+            let probe_cases = collect_probe_cases(op, &self.probes);
+            let boundary_cases = collect_boundary_cases(op, &components);
+            let tc_cases = collect_type_confusion_cases(op, &components);
+
+            let probe_count = u32::try_from(probe_cases.len()).unwrap_or(u32::MAX);
+            let boundary_count = u32::try_from(boundary_cases.len()).unwrap_or(u32::MAX);
+            let tc_count = u32::try_from(tc_cases.len()).unwrap_or(u32::MAX);
+            let op_total =
+                probe_count + boundary_count + tc_count + neighborhood_count + random_count;
+
+            total_requests += u64::from(op_total);
+
+            // Parameter names
+            let parameters: Vec<String> = op.parameters.iter().map(|p| p.name.clone()).collect();
+
+            // Body property names
+            let body_properties: Vec<String> = op
+                .request_body_schema
+                .as_ref()
+                .and_then(|s| s.get("properties"))
+                .and_then(|p| p.as_object())
+                .map(|props| props.keys().cloned().collect())
+                .unwrap_or_default();
+
+            // Matched probes
+            let matched_probes: Vec<MatchedProbe> = self
+                .probes
+                .iter()
+                .filter(|p| p.matches_operation(&op.method, &op.path))
+                .map(|p| MatchedProbe {
+                    target: p.target.clone(),
+                    values: p.to_json_values(),
+                })
+                .collect();
+
+            op_plans.push(OperationPlan {
+                operation: format!("{} {}", op.method, op.path),
+                method: op.method.clone(),
+                path: op.path.clone(),
+                total: op_total,
+                phases: PhaseCounts {
+                    probe: probe_count,
+                    boundary: boundary_count,
+                    type_confusion: tc_count,
+                    neighborhood: neighborhood_count,
+                    random: random_count,
+                },
+                parameters,
+                body_properties,
+                matched_probes,
+            });
+        }
+
+        // Config validation
+        let mut validations = apifuzz_core::dryrun::validate_config(config);
+
+        // Spec parse result
+        validations.push(Validation {
+            check: "spec_parse".into(),
+            status: if operations.is_empty() {
+                ValidationStatus::Error
+            } else {
+                ValidationStatus::Ok
+            },
+            message: format!("spec parsed: {} operations found", operations.len()),
+        });
+
+        // Probe → operation matching validation
+        for probe in &self.probes {
+            let matched = operations
+                .iter()
+                .any(|op| probe.matches_operation(&op.method, &op.path));
+            if !matched {
+                validations.push(Validation {
+                    check: "probe_match".into(),
+                    status: ValidationStatus::Warning,
+                    message: format!(
+                        "probe '{}' target '{}' does not match any operation in spec",
+                        probe.operation, probe.target
+                    ),
+                });
+            }
+        }
+
+        Ok(DryRunPlan {
+            operations: op_plans,
+            total_requests,
+            validations,
+        })
+    }
+
     /// Run the fuzzer. Returns output compatible with existing verdict pipeline.
     ///
     /// # Errors

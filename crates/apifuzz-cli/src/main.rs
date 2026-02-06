@@ -48,6 +48,10 @@ enum Commands {
         /// Config file (default: .apifuzz.toml)
         #[arg(short, long)]
         config: Option<String>,
+
+        /// Show execution plan without sending requests
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Initialize config file
@@ -114,6 +118,7 @@ fn run(cli: Cli) -> Result<i32> {
             level,
             output_dir,
             config,
+            dry_run,
         } => {
             // Load config
             let cfg = if let Some(path) = config {
@@ -121,6 +126,23 @@ fn run(cli: Cli) -> Result<i32> {
             } else {
                 Config::load_default()?
             };
+
+            let runner = NativeRunner::from_config(&cfg).with_level(level.into());
+
+            // Dry run: show plan and exit
+            if dry_run {
+                let plan = runner.plan(&cfg)?;
+                match cli.output {
+                    OutputFormat::Terminal => {
+                        println!("{}", plan.to_terminal());
+                    }
+                    OutputFormat::Json => {
+                        println!("{}", serde_json::to_string_pretty(&plan)?);
+                    }
+                    OutputFormat::Silent => {}
+                }
+                return Ok(if plan.has_errors() { 1 } else { 0 });
+            }
 
             if cli.output != OutputFormat::Silent {
                 eprintln!("Config:");
@@ -132,8 +154,6 @@ fn run(cli: Cli) -> Result<i32> {
                 eprintln!("  level:    {level:?}");
                 eprintln!();
             }
-
-            let runner = NativeRunner::from_config(&cfg).with_level(level.into());
 
             let fuzz_start = Instant::now();
             let output = runner.run()?;
