@@ -96,13 +96,13 @@ pub fn write_dump(
         total += count;
 
         for interaction in interactions {
-            let masked = if mask_headers {
-                mask_interaction(interaction)
+            let line = if mask_headers {
+                let masked = mask_interaction(interaction);
+                serde_json::to_string(&masked)
             } else {
-                interaction.clone()
-            };
-            let line =
-                serde_json::to_string(&masked).map_err(|e| DumpError::Serialize(e.to_string()))?;
+                serde_json::to_string(interaction)
+            }
+            .map_err(|e| DumpError::Serialize(e.to_string()))?;
             writer
                 .write_all(line.as_bytes())
                 .map_err(|e| DumpError::Io(format!("write {}: {e}", filepath.display())))?;
@@ -138,12 +138,17 @@ pub fn write_dump(
     Ok(index)
 }
 
+/// Maximum characters kept from the operation label in the filename.
+/// Prevents PATH_MAX issues on macOS (1024) and Linux (4096).
+const MAX_FILENAME_LEN: usize = 200;
+
 /// Convert an operation label to a safe filename.
 ///
 /// "POST /api/v2/users/{id}" → "POST_api_v2_users_id.jsonl"
 fn sanitize_filename(operation: &str) -> String {
     let sanitized: String = operation
         .chars()
+        .take(MAX_FILENAME_LEN)
         .map(|c| match c {
             'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '.' => c,
             _ => '_',
@@ -152,12 +157,19 @@ fn sanitize_filename(operation: &str) -> String {
     format!("{sanitized}.jsonl")
 }
 
+/// Returns true if the header name matches a known sensitive header (case-insensitive).
+fn is_sensitive_header(name: &str) -> bool {
+    SENSITIVE_HEADERS
+        .iter()
+        .any(|&h| name.eq_ignore_ascii_case(h))
+}
+
 /// Mask sensitive headers in an interaction.
 fn mask_interaction(interaction: &RawInteraction) -> RawInteraction {
     let mut masked = interaction.clone();
     if let Some(ref mut headers) = masked.case.headers {
         for (key, value) in headers.iter_mut() {
-            if SENSITIVE_HEADERS.contains(&key.to_ascii_lowercase().as_str()) {
+            if is_sensitive_header(key) {
                 *value = MASK.to_string();
             }
         }

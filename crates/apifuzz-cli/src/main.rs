@@ -119,15 +119,6 @@ fn main() -> ExitCode {
     }
 }
 
-fn format_pct_display(rate: f64) -> String {
-    let pct = rate * 100.0;
-    if pct == 0.0 || pct == 100.0 {
-        format!("{pct:.0}")
-    } else {
-        format!("{pct:.1}")
-    }
-}
-
 fn run(cli: Cli) -> Result<i32> {
     match cli.command {
         Commands::Fuzz {
@@ -291,7 +282,7 @@ fn run(cli: Cli) -> Result<i32> {
                                 "  {}: {} ({}% 2xx)",
                                 op.operation,
                                 status::format_distribution(&op.status_distribution),
-                                format_pct_display(op.success_rate),
+                                status::format_pct(op.success_rate),
                             );
                         }
                         // Global summary
@@ -300,7 +291,7 @@ fn run(cli: Cli) -> Result<i32> {
                             status::format_distribution(
                                 &status_analysis.global.status_distribution
                             ),
-                            format_pct_display(status_analysis.global.success_rate),
+                            status::format_pct(status_analysis.global.success_rate),
                         );
                     }
 

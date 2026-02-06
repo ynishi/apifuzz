@@ -176,16 +176,20 @@ pub fn compute_global_stats(op_stats: &[OperationStats]) -> GlobalStats {
 
 // ── Pattern detection ──
 
+/// Minimum fraction of responses that must share a pattern to trigger a warning.
+const PATTERN_THRESHOLD_PERCENT: u64 = 90;
+
 /// Detect the dominant status code pattern for an operation.
 ///
-/// Returns `Some(kind)` if ≥90% of responses share a recognizable pattern.
+/// Returns `Some(kind)` if ≥[`PATTERN_THRESHOLD_PERCENT`]% of responses share
+/// a recognizable pattern.
 fn detect_pattern(stats: &OperationStats) -> Option<StatusWarningKind> {
     if stats.total == 0 {
         return None;
     }
 
-    // Check if a single status class dominates (≥90%)
-    let threshold = (stats.total as f64 * 0.9).ceil() as u64;
+    // Integer-only ceiling: ⌈total * 90/100⌉
+    let threshold = (stats.total * PATTERN_THRESHOLD_PERCENT).div_ceil(100);
 
     let auth_count: u64 = stats
         .status_distribution
@@ -306,7 +310,10 @@ fn count_2xx(op: &OperationStats) -> u64 {
         .sum()
 }
 
-fn format_pct(rate: f64) -> String {
+/// Format a rate (0.0–1.0) as a percentage string.
+///
+/// Returns "0" for 0.0, "100" for 1.0, and one decimal place otherwise.
+pub fn format_pct(rate: f64) -> String {
     let pct = rate * 100.0;
     if pct == 0.0 || pct == 100.0 {
         format!("{pct:.0}")
