@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -44,5 +44,5 @@ proptest = "1"
 tempfile = "3"
 
 # Internal
-apifuzz-core = { path = "crates/apifuzz-core", version = "0.1.1" }
-apifuzz-runner = { path = "crates/apifuzz-runner", version = "0.1.1" }
+apifuzz-core = { path = "crates/apifuzz-core", version = "0.1.2" }
+apifuzz-runner = { path = "crates/apifuzz-runner", version = "0.1.2" }
