@@ -1,7 +1,7 @@
 # apifuzz
 
-Pure Rust API fuzzer. Generates requests from OpenAPI specs using a
-multi-phase strategy with 6 response validation checks (5xx detection,
+Pure Rust API fuzzer. Generates requests from OpenAPI specs (JSON or YAML)
+using a multi-phase strategy with 6 response validation checks (5xx detection,
 status conformance, negative testing, response time, schema validation,
 content-type conformance).
 
@@ -16,6 +16,10 @@ cargo install --path crates/apifuzz-cli
 ```bash
 apifuzz init                    # create .apifuzz.toml
 apifuzz fuzz --level quick      # run (quick/normal/heavy)
+apifuzz fuzz -n 200             # exact iteration count
+apifuzz fuzz --dry-run          # preview plan without HTTP
+apifuzz fuzz --dump             # save all req/res to JSONL
+apifuzz fuzz --stop-on-failure  # halt on first failure
 apifuzz guide                   # full usage reference
 ```
 

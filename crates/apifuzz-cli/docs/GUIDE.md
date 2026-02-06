@@ -19,7 +19,7 @@ apifuzz fuzz
 ## Configuration (.apifuzz.toml)
 
 ```toml
-spec = "openapi.json"          # OpenAPI 3.x spec file
+spec = "openapi.yaml"          # OpenAPI 3.x spec (JSON or YAML)
 base_url = "http://localhost:8080"
 
 [headers]
@@ -30,6 +30,17 @@ user_id = "1"                   # Fixed path param values
 
 # Response time limit in seconds (disabled by default)
 # response_time_limit = 5.0
+
+# Success criteria for status code evaluation:
+#   "default"      - warn on 2xx=0%, auto-detect auth/rate-limit patterns
+#   "require_2xx"  - fail if 2xx rate < min_success_rate (default 10%)
+#   "any_response" - record distribution, never fail on status alone
+# success_criteria = "default"
+# min_success_rate = 0.1
+
+# Dump all request/response pairs to JSONL files (default: false)
+# dump = true
+# dump_dir = ".apifuzz/dumps"
 
 # Custom probes: known-buggy values (highest priority, Phase 0)
 [[probes]]
@@ -42,6 +53,12 @@ int = [0, -1, 999999]          # integer values to inject
 # null = true                  # inject null
 ```
 
+### Spec Format
+
+Both JSON and YAML OpenAPI specs are supported. Detection order:
+1. File extension (`.json`, `.yaml`, `.yml`)
+2. Content sniffing (leading `{` → JSON, otherwise YAML)
+
 ### Probe Types
 
 | Field    | TOML Type    | JSON Result          |
@@ -52,13 +69,25 @@ int = [0, -1, 999999]          # integer values to inject
 | `bool`   | `[true]`    | `true`               |
 | `null`   | `true`      | `null`               |
 
-## Fuzz Levels
+## Fuzz Levels & Fine-Tuning
 
 ```bash
-apifuzz fuzz --level quick    # 100 requests/operation (fast CI)
-apifuzz fuzz --level normal   # 1000 requests/operation (default)
-apifuzz fuzz --level heavy    # 5000 requests/operation (thorough)
+# Presets (start here)
+apifuzz fuzz --level quick    # 100 neighborhood+random per op (fast CI)
+apifuzz fuzz --level normal   # 1000 per op (default)
+apifuzz fuzz --level heavy    # 5000 per op (thorough)
+
+# Fine-tuning (overrides --level for neighborhood+random count)
+apifuzz fuzz -n 200           # exact iteration count
+apifuzz fuzz --level heavy -n 200  # -n wins over level
+
+# Per-operation hard cap across ALL phases (probe+boundary+tc+near+rand)
+apifuzz fuzz --limit 50
 ```
+
+The `--level` preset controls neighborhood (Phase 2) and random (Phase 3)
+iteration counts. Deterministic phases (probe, boundary, type-confusion)
+always run fully unless `--limit` caps total requests per operation.
 
 ## 5-Phase Fuzzing Strategy
 
@@ -175,6 +204,58 @@ The response `Content-Type` header is compared against the media types
 declared in `responses.<status>.content` for the matching status code.
 Only the media type portion is compared (charset parameters are ignored).
 
+## Dry Run
+
+Preview the execution plan without sending any HTTP requests:
+
+```bash
+apifuzz fuzz --dry-run              # terminal summary
+apifuzz fuzz --dry-run --output json  # machine-readable plan
+```
+
+Shows per-operation phase counts, matched probes, and config validation.
+Useful for verifying setup before a real run.
+
+## Request/Response Dumps
+
+Save all interactions (not just failures) to per-operation JSONL files:
+
+```bash
+apifuzz fuzz --dump                        # writes to .apifuzz/dumps/
+apifuzz fuzz --dump --dump-dir ./my-dumps  # custom directory
+```
+
+Or enable permanently in `.apifuzz.toml`:
+
+```toml
+dump = true
+dump_dir = ".apifuzz/dumps"
+```
+
+Sensitive headers (`Authorization`, `Cookie`, etc.) are automatically masked.
+An `index.json` summarizes all dumped files.
+
+## Stop on Failure
+
+```bash
+apifuzz fuzz --stop-on-failure    # halt on first failure (fast CI feedback)
+```
+
+## Status Code Analysis
+
+apifuzz analyzes the status code distribution across all operations and
+auto-detects problematic patterns:
+
+| Pattern | Trigger | Action |
+|---------|---------|--------|
+| Authentication issue | ≥90% are 401/403 | Warn (or fail with `require_2xx`) |
+| Rate limited | ≥90% are 429 | Warn |
+| Endpoint not found | ≥90% are 404 | Warn |
+| No successful responses | 0% 2xx | Warn |
+| Low success rate | Below `min_success_rate` | Fail (only with `require_2xx`) |
+
+Configure with `success_criteria` in `.apifuzz.toml` (see Configuration above).
+
 ## Output Formats
 
 ```bash
@@ -200,7 +281,11 @@ Compatible with VS Code REST Client and IntelliJ HTTP Client.
 ## CI Example
 
 ```yaml
+# Quick check
 - run: apifuzz fuzz --level quick --output json --strict true
+
+# Fast-fail with dump for debugging
+- run: apifuzz fuzz --level quick --stop-on-failure --dump --output json
 ```
 
 ## Subcommands
@@ -234,8 +319,12 @@ int = [0]
 This tool is designed to be used by both humans and AI agents.
 Key points for programmatic use:
 
-- `--output json` returns structured results
+- `--output json` returns structured results (verdict, stats, status analysis, failures)
 - `--output silent` + exit code for pass/fail checks
+- `--dry-run --output json` for pre-flight validation without HTTP
+- `--dump` saves all request/response pairs for post-hoc analysis
+- `--stop-on-failure` for fast CI feedback
+- `-n 50` for minimal smoke tests
 - `apifuzz guide` prints this reference (no network needed)
 - `apifuzz doctor` validates setup before running
 - Probes in TOML allow declarative regression tests
